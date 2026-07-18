@@ -140,6 +140,11 @@ if os.path.exists(ICON):
     args[args.index(SRC):args.index(SRC)] = [
         "--icon", ICON, "--add-data", f"{ICON};.",  # 程序图标 + 内嵌供窗口使用
     ]
+if os.path.isdir("plugins"):
+    args[args.index(SRC):args.index(SRC)] = [
+        # 整个 plugins/ 打进 onefile（默认含所有插件）；运行时从 _MEIPASS/plugins 加载
+        "--add-data", "plugins" + os.pathsep + "plugins",
+    ]
 
 ret = subprocess.run(args).returncode
 

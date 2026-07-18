@@ -9,6 +9,8 @@ build/
 _version_info.txt
 # CI 发布时临时生成的发布说明（内容取自代码里的 CHANGELOG，用完即弃）
 RELEASE_NOTES.md
+# 示例代码
+example/
 
 # ===== Python =====
 __pycache__/

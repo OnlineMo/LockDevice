@@ -29,6 +29,8 @@ import getpass
 import threading
 import subprocess
 import traceback
+import importlib.util
+import types
 import tkinter as tk
 from tkinter import messagebox
 
@@ -64,10 +66,15 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.3.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.4.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.4.0": [
+        "插件系统：新增 plugins/ 目录，自动识别并加入插件（打包默认包含所有插件）；主页每个插件一个按钮 + 统一「⚙ 设置」页（与本体共用 config.json、按插件分区）；本体暴露锁机等函数供插件调用，插件与本体分离、独立演进",
+        "界面：启动器主按钮更名为「🎯 专注锁定」（绿色运行 / 已安装打开 两处）",
+        "首个插件 自动锁机 v1.0.0（最小版）：设定每天固定时间自动锁机一段时长（DailyTrigger 计划任务，复用模式一全屏锁定；后续支持节假日/按周/按月）",
+    ],
     "1.3.0": [
         "模式二（定时关机）新增「⚡ 开始后立即关机」附加开关：不留 25 秒缓冲、开始即关，防止在倒计时窗口内清除数据逃脱（可与登录前/后自由组合）",
         "模式一锁屏新增「🌙 息屏」按钮：仅熄灭显示器防烧屏（不锁屏），点击后延迟 1 秒再息屏、避免点击瞬间又亮屏",
@@ -123,12 +130,14 @@ GREEN_CACHE_DIR = os.path.join(SYSROOT, "Temp", "LockDevice")
 
 TASK_SHUTDOWN = "LockDevice_Shutdown"   # 定时关机守护
 TASK_BOOT = "LockDevice_Boot"           # 开机自启（仅锁定期间存在，恢复锁定）
+TASK_PLUGIN_BOOT = "LockDevice_PluginBoot"  # 插件开机自启（仅当有插件声明需要时才存在）
 TASK_OPEN = "LockDevice_Open"           # 按需打开界面（提权免 UAC）
 TASK_UNINSTALL = "LockDevice_Uninstall" # 按需卸载（提权免 UAC）
 
 DEFAULT_CONFIG = {"mode": 1, "minutes": 30, "lock_until": None, "guard": True,
                   "block_taskmgr": False, "mode2_preboot": False, "mode2_instant": False,
-                  "shortcuts": [], "skip_version": None}
+                  "shortcuts": [], "skip_version": None,
+                  "plugins": {}, "plugins_autostart": []}
 
 # 界面配色
 FONT = "Microsoft YaHei"
@@ -589,6 +598,162 @@ def create_boot_task():
         desc="LockDevice 开机自启（恢复未结束的锁定 · 结束后自动移除）"))
 
 
+# ------------------------------------------------------------------ 插件系统
+# 插件放 plugins/ 目录，运行时自动识别加入；打包时整个目录打进 exe（见 build.py）。
+# 关键：PyInstaller onefile 下入口以 __main__ 运行，插件不能 import 本体——本体把可用能力
+# 打包成一个 api 命名空间注入给插件（_build_plugin_api）。坏插件被 try/except 隔离、不拖垮本体。
+_PLUGINS_CACHE = None
+
+
+def _plugins_dir():
+    """插件目录：冻结态在 _MEIPASS 解包目录，源码态在脚本同级（复用 _icon_path 的定位模式）。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(_self_path())
+    return os.path.join(base, "plugins")
+
+
+def load_plugins(force=False):
+    """加载 plugins/*.py → [(meta, module), ...]。逐个隔离，坏插件只记日志、不影响其它。"""
+    global _PLUGINS_CACHE
+    if _PLUGINS_CACHE is not None and not force:
+        return _PLUGINS_CACHE
+    out = []
+    d = _plugins_dir()
+    if d and os.path.isdir(d):
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py") or fn.startswith("_"):
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "ld_plugin_" + os.path.splitext(fn)[0], os.path.join(d, fn))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                meta = getattr(mod, "PLUGIN", None)
+                if isinstance(meta, dict) and meta.get("id"):
+                    out.append((meta, mod))
+            except Exception:
+                _log("插件加载失败 " + fn + "\n" + traceback.format_exc())
+    _PLUGINS_CACHE = out
+    return out
+
+
+def _find_plugin(pid):
+    for meta, mod in load_plugins():
+        if meta.get("id") == pid:
+            return meta, mod
+    return None, None
+
+
+def _daily_trigger(hh, mm):
+    """每天 hh:mm 触发（CalendarTrigger + ScheduleByDay，间隔 1 天）。日期用今天、时间用 hh:mm。"""
+    lt = time.localtime()
+    start = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}T{int(hh):02d}:{int(mm):02d}:00"
+    return "\n".join([
+        "    <CalendarTrigger>",
+        f"      <StartBoundary>{start}</StartBoundary>",
+        "      <Enabled>true</Enabled>",
+        "      <ScheduleByDay>",
+        "        <DaysInterval>1</DaysInterval>",
+        "      </ScheduleByDay>",
+        "    </CalendarTrigger>",
+    ])
+
+
+def _sync_plugin_autostart():
+    """按 config.plugins_autostart 记账建/删共享的插件开机自启任务（登录触发·当前用户·免 UAC）。"""
+    if bool(load_config().get("plugins_autostart")):
+        cmd, args = _action_for("--plugin-boot")
+        _register_task(TASK_PLUGIN_BOOT, _task_xml(
+            _logon_trigger(), cmd, args, run_level="LeastPrivilege",
+            system=False, on_demand=False, desc="LockDevice 插件开机自启"))
+    else:
+        _delete_task(TASK_PLUGIN_BOOT)
+
+
+def _build_plugin_api(app=None):
+    """本体暴露给插件的能力命名空间。app=None → 无界面（CLI 回调）用途，UI 字段缺省。"""
+    def get_settings(pid):
+        return dict(load_config().get("plugins", {}).get(pid, {}))
+
+    def save_settings(pid, values):
+        cfg = load_config()
+        cfg.setdefault("plugins", {})[pid] = dict(values)
+        save_config(cfg)
+
+    def set_autostart(pid, on):
+        cfg = load_config()
+        lst = [x for x in cfg.get("plugins_autostart", []) if x != pid]
+        if on:
+            lst.append(pid)
+        cfg["plugins_autostart"] = lst
+        save_config(cfg)
+        _sync_plugin_autostart()
+
+    def register_task(name, trigger_xml, extra_args, **kw):
+        kw.setdefault("run_level", "LeastPrivilege")   # 默认当前用户·最低权限，免 UAC
+        kw.setdefault("system", False)
+        kw.setdefault("on_demand", False)
+        kw.setdefault("desc", "LockDevice 插件任务")
+        cmd, args = _action_for(extra_args)
+        return _register_task(name, _task_xml(trigger_xml, cmd, args, **kw))
+
+    def lock_command(minutes, mode=1):
+        # 复用本体锁机：返回计划任务动作参数（模式一全屏锁 / 模式二定时关机）
+        if int(mode) == 2:
+            return f"--startshutdown {int(minutes)}"
+        return f"--startlock {int(minutes) * 60}"
+
+    def start_lock(minutes, mode=1):
+        if app is None:
+            return
+        if int(mode) == 2:
+            app.start_mode2_lock(int(minutes))
+        else:
+            app.start_mode1_lock(int(minutes) * 60)
+
+    def info(msg, title="LockDevice"):
+        if app is not None and not DRY_RUN:
+            messagebox.showinfo(title, msg)
+        else:
+            _log(f"[plugin] {msg}")
+
+    def confirm(msg, title="LockDevice"):
+        if app is not None and not DRY_RUN:
+            return bool(messagebox.askyesno(title, msg))
+        return True
+
+    def error(msg, title="LockDevice"):
+        if app is not None and not DRY_RUN:
+            messagebox.showerror(title, msg)
+        else:
+            _log(f"[plugin ERROR] {msg}")
+
+    # 只暴露「后端能力 + 工具箱无关的对话框」——界面全由本体按插件声明的 SETTINGS/ACTIONS 渲染，
+    # 插件不碰任何 GUI 组件。这样以后本体从 tkinter 换成 Qt，插件零改动。
+    return types.SimpleNamespace(
+        get_settings=get_settings, save_settings=save_settings, set_autostart=set_autostart,
+        register_task=register_task, delete_task=_delete_task, task_exists=_task_exists,
+        daily_trigger=_daily_trigger, action_for=_action_for,
+        lock_command=lock_command, start_lock=start_lock,
+        is_admin=is_admin, is_installed=is_installed, relaunch_as_admin=relaunch_as_admin,
+        DRY_RUN=DRY_RUN, VERSION=VERSION, log=_log,
+        info=info, confirm=confirm, error=error)
+
+
+def _cleanup_plugins():
+    """卸载 / 清除数据时清理各插件残留（自身建的任务等）+ 共享的插件开机自启任务。"""
+    api = _build_plugin_api(None)
+    for _meta, mod in load_plugins():
+        if hasattr(mod, "on_uninstall"):
+            try:
+                mod.on_uninstall(api)
+            except Exception:
+                _log("plugin on_uninstall 失败\n" + traceback.format_exc())
+    _delete_task(TASK_PLUGIN_BOOT)
+
+
 def _make_lnk(lnk_path, target, args, icon, workdir):
     """用 PowerShell 的 WScript.Shell 创建带图标的 .lnk 快捷方式。"""
     if DRY_RUN:
@@ -798,6 +963,7 @@ def do_uninstall():
     d = installed_dir()
     for t in (TASK_BOOT, TASK_OPEN, TASK_UNINSTALL, TASK_SHUTDOWN):
         _delete_task(t)
+    _cleanup_plugins()   # 各插件清理自己的任务 + 删共享的插件开机自启任务
     remove_shortcuts()
     if DRY_RUN:
         print(f"[DRY] 删除安装目录 {d or APP_DIR}")
@@ -879,6 +1045,7 @@ def set_taskmgr_disabled(disabled):
 def clear_data():
     """清除绿色运行留下的数据与登录自启项（手动强制清除，会清掉保存的设置）。"""
     removed = []
+    _cleanup_plugins()   # 先让各插件清掉自己建的任务（如自动锁机的每日任务）
     if run_key_exists() or DRY_RUN:
         remove_run_key()
         removed.append("HKCU\\Run\\LockDevice 自启项")
@@ -1136,6 +1303,7 @@ class App:
         self.root.report_callback_exception = self._log_cb_exc
         _set_icon(self.root)
         self.content = None
+        self.plugin_api = _build_plugin_api(self)   # 注入给插件的能力命名空间
 
     def _log_cb_exc(self, exc, val, tb):
         _log("CALLBACK 异常:\n" + "".join(traceback.format_exception(exc, val, tb)))
@@ -1232,17 +1400,132 @@ class App:
         else:
             stext, scolor = f"○ 未安装 · 绿色 / 便携模式 · v{VERSION}", "gray"
         ctk.CTkLabel(c, text=stext, text_color=scolor, font=(FONT, 12)).pack(pady=(2, 20))
+        if installed and has_update():
+            self._btn(c, f"🔄  更新到 v{VERSION}", self.on_update, COL_ORANGE).pack(fill="x", pady=6)
+        # 主操作：进入锁定设置（绿色 / 已安装同名「专注锁定」）
+        self._btn(c, "🎯   专注锁定", self.show_main, COL_GREEN).pack(fill="x", pady=6)
+        # 每个已识别插件一个按钮（插件只声明 SETTINGS/ACTIONS，本体渲染其单页）+ 统一「设置」入口。
+        # 两模式都显示；插件多了改用 CTkScrollableFrame
+        plugins = load_plugins()
+        for meta, mod in plugins:
+            if getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None):
+                label = meta.get("button") or meta.get("name") or meta.get("id")
+                self._btn(c, label, (lambda mt=meta, md=mod: self._show_plugin(mt, md)),
+                          COL_BLUE).pack(fill="x", pady=6)
+        if any(getattr(mod, "SETTINGS", None) for _m, mod in plugins):
+            self._btn(c, "⚙   设置", self.show_settings, COL_GRAY).pack(fill="x", pady=6)
+        # 次要操作
         if installed:
-            if has_update():
-                self._btn(c, f"🔄  更新到 v{VERSION}", self.on_update, COL_ORANGE).pack(fill="x", pady=6)
-            self._btn(c, "▶   打开", self.show_main, COL_GREEN).pack(fill="x", pady=6)
             self._btn(c, "✖   卸载", self.on_uninstall, COL_RED).pack(fill="x", pady=6)
         else:
-            self._btn(c, "🟢  绿色运行（免安装）", self.show_main, COL_GREEN).pack(fill="x", pady=6)
             self._btn(c, "⬇   安装到本机", self.on_install, COL_BLUE).pack(fill="x", pady=6)
             ctk.CTkLabel(c, text="安装 = 智能开机自启 + 重启恢复 + 此后免管理员（需一次授权）",
                          text_color="gray", font=(FONT, 11), wraplength=410).pack(pady=(2, 4))
             self._btn(c, "🧹  清除数据（清理绿色/便携残留）", self.on_clear_data, COL_GRAY).pack(fill="x", pady=6)
+        self._bring_to_front()
+
+    # ---------------- 插件统一设置页（单窗切换） ----------------
+    def show_settings(self):
+        self.root.deiconify()
+        c = self._clear()
+        ctk.CTkLabel(c, text="⚙  设置", font=(FONT, 22, "bold")).pack(pady=(4, 2))
+        ctk.CTkLabel(c, text="插件设置 · 与本体共用配置、按插件分区", text_color="gray",
+                     font=(FONT, 11)).pack(pady=(0, 8))
+        bottom = ctk.CTkFrame(c, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", pady=(6, 0))
+        self._btn(bottom, "💾  保存", self._save_settings, COL_GREEN).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(bottom, text="←  返回", fg_color=COL_GRAY,
+                      command=self.show_launcher).pack(fill="x")
+        box = ctk.CTkScrollableFrame(c, fg_color="transparent")
+        box.pack(side="top", fill="both", expand=True)
+        self._settings_vars = []   # [(pid, key, type, tk_var)]
+        plugins = [(m, mod) for m, mod in load_plugins() if getattr(mod, "SETTINGS", None)]
+        if not plugins:
+            ctk.CTkLabel(box, text="（暂无可配置的插件）", text_color="gray").pack(pady=10)
+        self._render_plugin_settings(box, plugins)
+        self._bring_to_front()
+
+    def _render_setting_field(self, box, pid, field, vals):
+        key, ftype = field["key"], field.get("type", "str")
+        cur = vals.get(key, field.get("default"))
+        row = ctk.CTkFrame(box, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=3)
+        if ftype == "bool":
+            var = tk.BooleanVar(value=bool(cur))
+            ctk.CTkCheckBox(row, text=field.get("label", key), variable=var,
+                            font=(FONT, 12)).pack(anchor="w")
+        elif ftype == "choice":
+            opts = [str(o) for o in field.get("options", [])]
+            var = tk.StringVar(value=str(cur if cur is not None else (opts[0] if opts else "")))
+            ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
+            ctk.CTkOptionMenu(row, variable=var, values=opts, width=150).pack(side="right")
+        else:   # int / str
+            var = tk.StringVar(value="" if cur is None else str(cur))
+            ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
+            ctk.CTkEntry(row, textvariable=var, width=150, justify="center").pack(side="right")
+        self._settings_vars.append((pid, key, ftype, var))
+
+    def _save_settings(self):
+        cfg = load_config()
+        cfg.setdefault("plugins", {})
+        touched = {}
+        for pid, key, ftype, var in getattr(self, "_settings_vars", []):
+            v = var.get()
+            if ftype == "bool":
+                v = bool(v)
+            elif ftype == "int":
+                try:
+                    v = int(str(v).strip())
+                except (ValueError, TypeError):
+                    v = 0
+            touched.setdefault(pid, {})[key] = v
+        for pid, values in touched.items():
+            merged = dict(cfg["plugins"].get(pid, {}))
+            merged.update(values)
+            cfg["plugins"][pid] = merged
+        save_config(cfg)
+        for meta, mod in load_plugins():
+            if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
+                try:
+                    mod.on_settings_saved(self.plugin_api, dict(cfg["plugins"].get(meta["id"], {})))
+                except Exception:
+                    _log("plugin on_settings_saved 失败 " + meta["id"] + "\n" + traceback.format_exc())
+        messagebox.showinfo("已保存", "设置已保存。")
+        self.show_settings()
+
+    def _render_plugin_settings(self, box, plugins):
+        """按各插件声明的 SETTINGS（前端 schema）渲染表单，填充 self._settings_vars。"""
+        cfg = load_config()
+        for meta, mod in plugins:
+            pid = meta["id"]
+            vals = cfg.get("plugins", {}).get(pid, {})
+            ctk.CTkLabel(box, text=meta.get("name", pid), font=(FONT, 14, "bold"),
+                         anchor="w").pack(fill="x", padx=4, pady=(10, 2))
+            for field in getattr(mod, "SETTINGS", []):
+                self._render_setting_field(box, pid, field, vals)
+
+    def _show_plugin(self, meta, mod):
+        """插件单页（单窗切换）：本体按插件声明的 SETTINGS + ACTIONS 渲染；插件只写后端。"""
+        self.root.deiconify()
+        c = self._clear()
+        ctk.CTkLabel(c, text=meta.get("name", meta["id"]), font=(FONT, 22, "bold")).pack(pady=(4, 2))
+        ctk.CTkLabel(c, text=f"v{meta.get('version', '')}", text_color="gray",
+                     font=(FONT, 11)).pack(pady=(0, 8))
+        bottom = ctk.CTkFrame(c, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", pady=(6, 0))
+        self._btn(bottom, "💾  保存", self._save_settings, COL_GREEN).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(bottom, text="←  返回", fg_color=COL_GRAY,
+                      command=self.show_launcher).pack(fill="x")
+        box = ctk.CTkScrollableFrame(c, fg_color="transparent")
+        box.pack(side="top", fill="both", expand=True)
+        self._settings_vars = []
+        self._render_plugin_settings(box, [(meta, mod)])
+        # 动作按钮（ACTIONS 声明 → 本体渲染，点击调插件后端函数）
+        for act in getattr(mod, "ACTIONS", []) or []:
+            fn = getattr(mod, act.get("fn", ""), None)
+            if callable(fn):
+                self._btn(box, act.get("label", act.get("fn", "")),
+                          (lambda f=fn: f(self.plugin_api)), COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
         self._bring_to_front()
 
     def on_install(self):
@@ -2039,6 +2322,35 @@ def main():
         app = App()
         app.root.withdraw()
         app.start_mode2_lock(mins, preboot=True, confirmed=True)
+        return
+
+    if "--plugin-boot" in argv:   # 插件开机自启任务触发 → 调各声明需要自启的插件 on_boot
+        api = _build_plugin_api(None)
+        for pid in load_config().get("plugins_autostart", []):
+            _m, mod = _find_plugin(pid)
+            if mod is not None and hasattr(mod, "on_boot"):
+                try:
+                    mod.on_boot(api)
+                except Exception:
+                    _log("plugin on_boot 失败 " + str(pid) + "\n" + traceback.format_exc())
+        return
+
+    if "--plugin" in argv:   # 计划任务回调路由：--plugin <id> [...] → 插件 handle_cli
+        try:
+            pid = argv[argv.index("--plugin") + 1]
+        except IndexError:
+            return
+        _m, mod = _find_plugin(pid)
+        if mod is not None and hasattr(mod, "handle_cli"):
+            try:
+                mod.handle_cli(argv, _build_plugin_api(None))
+            except Exception:
+                _log("plugin handle_cli 失败 " + str(pid) + "\n" + traceback.format_exc())
+        return
+
+    if "--list-plugins" in argv:   # 诊断：打印已识别插件（也用于验证冻结态 _MEIPASS 加载）
+        for meta, _mod in load_plugins():
+            print(f"{meta.get('id')}\t{meta.get('name', '')}\tv{meta.get('version', '')}")
         return
 
     # --open（提权打开）或无参数：显示启动器
