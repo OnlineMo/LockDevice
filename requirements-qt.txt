@@ -1,0 +1,4 @@
+# PySide6 + qfluentwidgets 界面（重构中，见 docs/GUI_QT_MIGRATION.md）
+# 迁移完成后并入 requirements.txt、并从中移除 customtkinter。
+PySide6
+PySide6-Fluent-Widgets
