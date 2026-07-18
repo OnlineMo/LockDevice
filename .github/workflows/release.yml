@@ -1,0 +1,89 @@
+name: 构建并发布
+
+# 触发：推送改动了 lock_device.py（通常是 VERSION 递增）→ 自动构建 exe 并发布 Release。
+# 若该版本的 tag 已存在则跳过、不重复发布。也可在 Actions 页手动触发（workflow_dispatch）。
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'lock_device.py'
+      - 'build.py'
+      - 'requirements.txt'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 创建 tag / release 需要写权限
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest      # 生成 Windows exe 必须用 Windows runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取 VERSION
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -nE 's/^VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' lock_device.py | head -n1)
+          [ -n "$v" ] || { echo "❌ 未从 lock_device.py 读到 VERSION"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v"    >> "$GITHUB_OUTPUT"
+          echo "📦 VERSION = $v"
+
+      - name: 该版本是否已发布
+        id: check
+        shell: bash
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.ver.outputs.tag }}" | grep -q .; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "⏭️ ${{ steps.ver.outputs.tag }} 已存在，跳过发布。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "🆕 新版本，开始构建。"
+          fi
+
+      - name: 安装 Python
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 构建 exe（--upgrade：所有依赖升级到最新再打包）
+        if: steps.check.outputs.exists == 'false'
+        run: python build.py --upgrade
+
+      - name: 生成发布说明（取自 lock_device.py 的 CHANGELOG）
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python - <<'PY'
+          import re, os, ast
+          ver = os.environ["VERSION"]
+          try:
+              src = open("lock_device.py", encoding="utf-8").read()
+              m = re.search(r'^CHANGELOG\s*=\s*(\{.*?^\})', src, re.M | re.S)
+              items = ast.literal_eval(m.group(1)).get(ver, [])
+          except Exception:
+              items = []
+          out = [f"## LockDevice v{ver}", ""]
+          out += [f"- {x}" for x in items] or ["见提交记录。"]
+          out += ["", f"下载下方的 `LockDevice-{ver}.exe`，双击即用（无需安装 Python）。"]
+          open("RELEASE_NOTES.md", "w", encoding="utf-8").write("\n".join(out))
+          PY
+
+      - name: 发布 Release + 上传 exe
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: LockDevice ${{ steps.ver.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: dist/LockDevice-${{ steps.ver.outputs.version }}.exe
+          fail_on_unmatched_files: true

@@ -1,0 +1,40 @@
+# ===== 本地构建产物（不发云端，发布走 GitHub Release）=====
+# 打包出的 exe
+dist/
+# PyInstaller 中间产物
+build/
+# PyInstaller 生成（LockDevice.spec），打包时自动重建
+*.spec
+# build.py 临时生成的版本资源
+_version_info.txt
+# CI 发布时临时生成的发布说明（内容取自代码里的 CHANGELOG，用完即弃）
+RELEASE_NOTES.md
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== 测试 / 临时脚本 =====
+_t_*.py
+
+# ===== 本地文档（详细版留本地，不发云端）=====
+README.local.md
+
+# ===== 运行期日志 =====
+*.log
+
+# ===== 编辑器 / 工具 =====
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# ===== 操作系统 =====
+Thumbs.db
+Desktop.ini
+.DS_Store

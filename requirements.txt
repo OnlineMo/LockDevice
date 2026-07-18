@@ -1,0 +1,7 @@
+# LockDevice 依赖 —— 不锁版本，每次都装最新（--upgrade）
+
+# 运行依赖：现代化界面（缺它后台仍可运行，但界面需要）
+customtkinter
+
+# 打包依赖：构建单文件 exe
+pyinstaller
