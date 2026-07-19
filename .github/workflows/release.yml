@@ -85,5 +85,5 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: LockDevice ${{ steps.ver.outputs.version }}
           body_path: RELEASE_NOTES.md
-          files: dist/LockDevice-${{ steps.ver.outputs.version }}.exe
+          files: dist/LockDevice-${{ steps.ver.outputs.version }}-*.exe
           fail_on_unmatched_files: true

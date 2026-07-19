@@ -125,54 +125,75 @@ else:
 
 write_version_info(VERSION)
 
-print("\n[2/2] 打包中（首次较慢，请耐心等待）...")
-args = [
-    PY, "-m", "PyInstaller",
-    "--noconfirm", "--clean",
-    "--onefile",                       # 打成单个 exe
-    "--windowed",                      # GUI 程序，无控制台黑框
-    "--name", NAME,
-    "--version-file", VER_FILE,        # 版本信息写入 exe 属性
-    "--collect-all", "customtkinter",  # 打包 customtkinter 的主题/资源（必须）
-    SRC,
+# 4 个变体：(后缀, 含 Qt 界面, 含插件, 说明)
+VARIANTS = [
+    ("tk",         False, False, "tkinter · 无插件（最小）"),
+    ("tk-plugins", False, True,  "tkinter · 全插件"),
+    ("qt-plugins", True,  True,  "Qt · 全插件"),
+    ("qt",         True,  False, "Qt · 无插件"),
 ]
-if os.path.exists(ICON):
-    args[args.index(SRC):args.index(SRC)] = [
-        "--icon", ICON, "--add-data", f"{ICON};.",  # 程序图标 + 内嵌供窗口使用
-    ]
-if os.path.isdir("plugins"):
-    args[args.index(SRC):args.index(SRC)] = [
-        # 整个 plugins/ 打进 onefile（默认含所有插件）；运行时从 _MEIPASS/plugins 加载
-        "--add-data", "plugins" + os.pathsep + "plugins",
-    ]
+_names = {s for s, *_ in VARIANTS}
+_only = [a for a in sys.argv[1:] if a in _names]   # python build.py qt / tk-plugins ...（不指定则全打）
+_todo = [v for v in VARIANTS if not _only or v[0] in _only]
 
-ret = subprocess.run(args).returncode
 
-# 打包出的是 dist\LockDevice.exe，改名为带版本号的最终文件
-built = os.path.join("dist", NAME + ".exe")
-out = os.path.join("dist", OUT_NAME)
-if ret == 0 and os.path.exists(built):
-    try:
-        if os.path.exists(out):
-            os.remove(out)
-        os.replace(built, out)
-    except OSError as e:
-        print("⚠ 重命名为带版本号文件失败：", e)
-        out = built
+def build_one(suffix, with_gui, with_plugins, desc):
+    print(f"\n===== 构建 {suffix} · {desc} =====")
+    a = [PY, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+         "--name", NAME, "--version-file", VER_FILE]
+    if with_gui:    # Qt 现代界面：只收 gui 模块 + qfluentwidgets 资源；PySide6 交给自动分析（不 collect-all）
+        a += ["--hidden-import", "gui.app", "--hidden-import", "gui.lock",
+              "--collect-all", "qfluentwidgets",
+              # qt 版彻底不含 tk：模式一锁屏走 gui.lock（Qt 原生），故排除 customtkinter 与 tkinter 本身
+              "--exclude-module", "customtkinter",
+              "--exclude-module", "tkinter", "--exclude-module", "_tkinter"]
+        # qfluentwidgets 是纯 QWidget 组件，排除这些重型 Qt 模块（仅 WebEngine 就上百 MB）→ 大幅瘦身
+        for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick", "QtWebChannel",
+                  "QtQml", "QtQuick", "QtQuick3D", "QtQuickWidgets", "QtQuickControls2",
+                  "Qt3DCore", "Qt3DRender", "Qt3DExtras", "QtCharts", "QtDataVisualization",
+                  "QtMultimedia", "QtMultimediaWidgets", "QtPdf", "QtPdfWidgets", "QtSensors",
+                  "QtSerialPort", "QtBluetooth", "QtPositioning", "QtLocation",
+                  "QtDesigner", "QtHelp", "QtTest"):
+            a += ["--exclude-module", "PySide6." + m]
+    else:           # tkinter：收 customtkinter，排除 Qt，体积最小
+        a += ["--collect-all", "customtkinter",
+              "--exclude-module", "PySide6", "--exclude-module", "qfluentwidgets",
+              "--exclude-module", "shiboken6", "--exclude-module", "gui"]
+    if with_plugins and os.path.isdir("plugins"):
+        a += ["--add-data", "plugins" + os.pathsep + "plugins"]
+    if os.path.exists(ICON):
+        a += ["--icon", ICON, "--add-data", f"{ICON}{os.pathsep}."]
+    a.append(SRC)
+    ret = subprocess.run(a).returncode
+    built = os.path.join("dist", NAME + ".exe")
+    out = os.path.join("dist", f"{NAME}-{VERSION}-{suffix}.exe")
+    if ret == 0 and os.path.exists(built):
+        try:
+            if os.path.exists(out):
+                os.remove(out)
+            os.replace(built, out)
+            return out
+        except OSError as e:
+            print("⚠ 重命名失败：", e)
+            return built
+    return None
+
+
+print(f"\n[2/2] 打包（{len(_todo)} 个变体，首次较慢）...")
+results = [(s, d, build_one(s, g, p, d)) for s, g, p, d in _todo]
 
 try:
     os.remove(VER_FILE)
 except OSError:
     pass
 
-print("\n" + "=" * 50)
-if ret == 0 and os.path.exists(out):
-    size = os.path.getsize(out) / (1024 * 1024)
-    print(f"✅ 打包成功！({size:.1f} MB)  v{VERSION}")
-    print("   exe 路径:", os.path.abspath(out))
-    print("   文件名已带版本号；右键属性→详细信息 也可看到版本。")
-    print("   双击即用，无需 Python / venv。")
-    print("   提示：想安装到本机（开机自启/免UAC/定时关机），在程序里点「安装到本机」即可。")
-else:
-    print("❌ 打包失败，请往上翻看错误输出。")
-print("=" * 50)
+print("\n" + "=" * 58)
+print(f"  LockDevice v{VERSION} · 打包结果（dist\\）")
+print("=" * 58)
+for suffix, desc, out in results:
+    if out and os.path.exists(out):
+        size = os.path.getsize(out) / (1024 * 1024)
+        print(f"  ✅ {size:5.1f} MB  {os.path.basename(out):<30} {desc}")
+    else:
+        print(f"  ❌ 失败        {NAME}-{VERSION}-{suffix}.exe   {desc}")
+print("=" * 58)
