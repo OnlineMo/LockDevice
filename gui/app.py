@@ -264,6 +264,10 @@ class HomeInterface(ScrollArea):
         start = PrimaryPushButton("🔒  开始锁定")
         start.clicked.connect(self._start)
         v.addWidget(start)
+        self.cancel_sd = PushButton("⚠  解除已存在的关机计划")
+        self.cancel_sd.clicked.connect(self._cancel_shutdown)
+        v.addWidget(self.cancel_sd)
+        self._refresh_cancel_shutdown()
 
     def _sync(self):
         m1 = self.mode.currentIndex() == 0
@@ -376,7 +380,25 @@ class HomeInterface(ScrollArea):
         cfg["lock_until"] = end
         core.save_config(cfg)
         InfoBar.success("已启动", f"「{kind}关机」已设定", parent=self.win, position=InfoBarPosition.TOP)
+        self._refresh_cancel_shutdown()
         core.do_shutdown(0 if instant else core.SHUTDOWN_DELAY, "LockDevice：电脑即将关机，请保存文件")
+
+    def _refresh_cancel_shutdown(self):
+        """存在定时关机任务时才显示「解除」按钮（对应 tk show_main 的同款按钮）。"""
+        try:
+            exists = bool(core._task_exists(core.TASK_SHUTDOWN))
+        except Exception:
+            exists = False
+        self.cancel_sd.setVisible(exists)
+
+    def _cancel_shutdown(self):
+        ok, msg = core.remove_shutdown_task()
+        if ok:
+            InfoBar.success("已解除", "关机计划任务已删除。", parent=self.win, position=InfoBarPosition.TOP)
+        else:
+            InfoBar.error("解除失败", (msg or "") + " 若因权限失败请以管理员运行。",
+                          parent=self.win, position=InfoBarPosition.TOP, duration=-1)
+        self._refresh_cancel_shutdown()
 
 
 # ---------------------------------------------------------------- 每个插件一页
@@ -551,6 +573,12 @@ class MainWindow(FluentWindow):
             self.setWindowIcon(ico)
         self.resize(920, 640)
         self.plugin_api = core._build_plugin_api(None)
+        # 插件对话框走 Qt（否则 app=None 时只 _log、confirm 恒 True——弹窗成了 tk 专属）
+        self.plugin_api.info = lambda msg, title="LockDevice": InfoBar.success(
+            title, msg, parent=self, position=InfoBarPosition.TOP, duration=4000)
+        self.plugin_api.error = lambda msg, title="LockDevice": InfoBar.error(
+            title, msg, parent=self, position=InfoBarPosition.TOP, duration=-1)
+        self.plugin_api.confirm = lambda msg, title="LockDevice": bool(MessageBox(title, msg, self).exec())
         self.plugin_pages = {}
         self.home = HomeInterface(self)
         self.addSubInterface(self.home, FIF.HOME, "专注锁定")
@@ -579,6 +607,95 @@ class MainWindow(FluentWindow):
                 self.removeInterface(page)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------- 发现新版本（Qt 版更新窗）
+class UpdateWindow(QWidget):
+    """新版文件在已装机器上运行时的独立「发现更新」窗（对应 tkinter 的 show_update_window）。
+    此前已用最高权限任务免 UAC 打开了已安装（旧）版本；本窗只展示更新日志 + 更新/稍后/跳过。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("LockDevice · 发现新版本")
+        ico = _app_icon()
+        if not ico.isNull():
+            self.setWindowIcon(ico)
+        self.resize(480, 560)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 22, 28, 18)
+        root.setSpacing(10)
+        root.addWidget(TitleLabel("🔄  发现新版本"))
+        root.addWidget(SubtitleLabel(f"已安装 v{core.installed_version()}  →  新版本 v{core.VERSION}"))
+        tip = BodyLabel("已为你免管理员打开当前已安装的版本；如需升级点下方「更新」。")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+        root.addWidget(BodyLabel("更新内容"))
+
+        area = ScrollArea()
+        area.setWidgetResizable(True)
+        try:
+            area.enableTransparentBackground()
+        except Exception:
+            pass
+        area.setStyleSheet("QScrollArea{border:none;background:transparent}")
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(4, 2, 20, 2)   # 右侧留白给叠加式滚动条，免得遮住正文最后一个字
+        logs = core.changelog_since(core.installed_version())
+        if not logs:
+            il.addWidget(BodyLabel("（本版本未附更新说明）"))
+        for ver, notes in logs:
+            il.addWidget(SubtitleLabel(f"v{ver}"))
+            for line in notes:
+                bl = BodyLabel("·  " + line)
+                bl.setWordWrap(True)
+                il.addWidget(bl)
+        il.addStretch(1)
+        area.setWidget(inner)
+        root.addWidget(area, 1)
+
+        up = PrimaryPushButton(f"🔄  更新到 v{core.VERSION}")
+        up.clicked.connect(self._update)
+        root.addWidget(up)
+        brow = QHBoxLayout()
+        later = PushButton("稍后再说")
+        later.clicked.connect(self.close)
+        skip = PushButton("跳过此版本")
+        skip.clicked.connect(self._skip)
+        brow.addWidget(later, 1)
+        brow.addWidget(skip, 1)
+        root.addLayout(brow)
+        hint = BodyLabel("「稍后再说」下次仍提示；「跳过此版本」则此版本不再提示（有更高版本仍会提示）。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+    def _update(self):
+        d = core.installed_dir()
+        if not d:
+            return
+        core.save_install_opts({"dir": d, "desktop": False, "launch": True})
+        if core.relaunch_as_admin("--install"):
+            self.close()
+
+    def _skip(self):
+        cfg = core.load_config()
+        cfg["skip_version"] = core.VERSION
+        core.save_config(cfg)
+        self.close()
+
+
+def run_update_prompt():
+    """launcher 分流：新版文件在已装机器上运行时，弹 Qt「发现更新」窗（不提权、零 UAC）。"""
+    app = QApplication.instance() or QApplication(sys.argv)
+    ico = _app_icon()
+    if not ico.isNull():
+        app.setWindowIcon(ico)
+    setTheme(Theme.DARK)
+    w = UpdateWindow()
+    w.show()
+    w.raise_()
+    w.activateWindow()
+    app.exec()
 
 
 def run():
