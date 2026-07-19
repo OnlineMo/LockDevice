@@ -1,80 +1,95 @@
 # -*- coding: utf-8 -*-
-"""LockDevice 插件 · 自动锁机 auto_lock v1.0.0（最小版）
+"""LockDevice 插件 · 自动锁机 auto_lock v1.0.1（时间窗口版）
 
-每天固定时间自动锁机一段时长：建一个「每日触发」计划任务，到点复用本体的全屏锁定
-（--startlock）。本插件**只写后端 + 声明前端**（PLUGIN / SETTINGS / ACTIONS 都是纯数据），
-界面完全由本体按声明渲染——不 import 本体、不碰任何 GUI 组件（本体日后从 tkinter 换 Qt
-本插件零改动）。
+设定「每天 HH:MM 起、锁 N 分钟」= 一个每日时间窗口 [start, start+N)。
+**由插件在每次登录时自己检查**（本体的插件开机自启机制回调 on_boot）：
+- 当前在窗口内 → 锁「剩余时间」（迟到开机只锁剩下的）；
+- 已过窗口 → 不锁。
+不用 Windows 定时任务在固定点直接触发固定时长的锁定（那样迟到开机会锁满 N 分钟、过点还会锁，都错）。
 
-它靠自己建的每日计划任务持久（重启后照常触发），所以 autostart=False——即「不需要本体开机自启」
-的示例。后续方向：跳过节假日、节假日特设、按周循环、按月循环。
+因此本插件 **需要开机自启**（autostart=True）：启用时向本体登记，登录时被回调检查窗口。
+只写后端 + 声明前端（SETTINGS/ACTIONS 纯数据），不 import 本体、不碰 GUI。
+后续方向：跳过节假日、节假日特设、按周 / 按月。
 """
+import time
 
 PLUGIN = {
     "id": "auto_lock",
     "name": "自动锁机",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "button": "⏰  自动锁机",
-    "autostart": False,   # 靠自建的每日计划任务持久，不需要本体开机自启
+    "autostart": True,   # 需要：每次登录检查时间窗口、锁剩余时间
 }
 
-# 前端声明：本体据此渲染统一表单
 SETTINGS = [
     {"key": "enabled", "label": "启用每日自动锁机", "type": "bool", "default": False},
-    {"key": "time",    "label": "每天锁机时间 (HH:MM)", "type": "str", "default": "22:00"},
+    {"key": "time",    "label": "每天开始时间 (HH:MM)", "type": "str", "default": "22:00"},
     {"key": "minutes", "label": "锁机时长（分钟）", "type": "int", "default": 30},
 ]
 
-# 前端声明：本体渲染成按钮，点击调下面同名后端函数
 ACTIONS = [
     {"label": "🔒  立即锁一次", "fn": "lock_now"},
 ]
 
-_TASK = "LockDevice_Plugin_autolock"
 
-
-def _parse_hhmm(s):
+def _window(vals):
+    """解析出 (起始当天分钟数, 时长分钟)；非法返回 None。"""
     try:
-        hh, mm = str(s).strip().split(":")
-        hh, mm = int(hh), int(mm)
+        hh, mm = map(int, str(vals.get("time", "22:00")).strip().split(":"))
+        dur = max(1, int(vals.get("minutes", 30)))
         if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return hh, mm
+            return hh * 60 + mm, dur
     except Exception:
         pass
     return None
 
 
-def _minutes(vals):
-    try:
-        return max(1, int(vals.get("minutes", 30)))
-    except (ValueError, TypeError):
-        return 30
+def _remaining(vals):
+    """现在若在今天的窗口内，返回剩余分钟；否则 None。"""
+    w = _window(vals)
+    if not w:
+        return None
+    start, dur = w
+    lt = time.localtime()
+    now = lt.tm_hour * 60 + lt.tm_min
+    end = start + dur
+    return (end - now) if (start <= now < end) else None
 
 
 def on_settings_saved(api, values):
-    """保存设置后：启用 → 建/更新每日任务；停用 → 删除。"""
-    if not values.get("enabled"):
-        api.delete_task(_TASK)
-        return
-    hhmm = _parse_hhmm(values.get("time", "22:00"))
-    if not hhmm:
-        api.error("锁机时间格式应为 HH:MM（如 22:00）。")
-        return
-    minutes = _minutes(values)
-    ok, msg = api.register_task(_TASK, api.daily_trigger(*hhmm), api.lock_command(minutes),
-                                desc="LockDevice 自动锁机（每日定时）")
-    if ok:
-        api.info(f"已设定：每天 {hhmm[0]:02d}:{hhmm[1]:02d} 自动全屏锁定 {minutes} 分钟。")
+    """保存设置：启用 → 登记开机自启（登录时 on_boot 检查窗口）；停用 → 注销。不建定时触发任务。"""
+    enabled = bool(values.get("enabled"))
+    api.set_autostart("auto_lock", enabled)
+    w = _window(values)
+    if enabled and w:
+        api.info(f"已启用：每天 {w[0] // 60:02d}:{w[0] % 60:02d} 起锁 {w[1]} 分钟。\n"
+                 f"在此时段内开机会自动锁定「剩余时间」；过点开机则不锁。")
+    elif enabled:
+        api.error("开始时间格式应为 HH:MM（如 22:00）。")
     else:
-        api.error("创建每日锁机任务失败：\n" + (msg or "未知错误"))
+        api.info("已停用每日自动锁机。")
+
+
+def on_boot(api):
+    """每次登录被本体回调：在窗口内就锁「剩余时间」。"""
+    vals = api.get_settings("auto_lock")
+    if not vals.get("enabled"):
+        return
+    rem = _remaining(vals)
+    if rem:
+        api.log(f"[auto_lock] 在窗口内，锁定剩余 {rem} 分钟")
+        api.start_lock(rem)
 
 
 def on_uninstall(api):
-    api.delete_task(_TASK)
+    api.set_autostart("auto_lock", False)
 
 
 def lock_now(api):
-    """立即锁一次（时长取当前配置，默认 30 分钟）。"""
-    minutes = _minutes(api.get_settings("auto_lock"))
-    if api.confirm(f"立即全屏锁定 {minutes} 分钟？"):
-        api.start_lock(minutes)
+    """立即锁一次（整段时长，默认 30 分钟）。"""
+    try:
+        m = max(1, int(api.get_settings("auto_lock").get("minutes", 30)))
+    except (ValueError, TypeError):
+        m = 30
+    if api.confirm(f"立即全屏锁定 {m} 分钟？"):
+        api.start_lock(m)
