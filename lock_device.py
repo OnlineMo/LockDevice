@@ -72,10 +72,14 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.5.1"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.5.2"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.5.2": [
+        "修复 Qt 版更新提示：装了旧版后运行新版，Qt 版此前不弹「发现更新」窗（只有 tkinter 版弹）——现补上 Qt 更新窗（更新日志 + 更新 / 稍后再说 / 跳过此版本）。",
+        "补齐 Qt 与 tkinter 界面对齐：插件的 提示 / 确认 / 错误对话框在 Qt 下改用 Fluent 弹窗（此前被静默、且确认框恒为「是」）；主页补「解除已存在的关机计划」按钮。",
+    ],
     "1.5.1": [
         "插件热添加：exe 现在会扫描自身同目录的 plugins/ 文件夹——把插件 .py 丢进去、重启即识别（此前只认打包进 exe 的内置插件）；外置同名插件覆盖内置，可热更新。",
     ],
@@ -2501,13 +2505,15 @@ def main():
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         try:
             from PySide6.QtWidgets import QApplication
-            from gui.app import MainWindow, ShortcutDialog, InstallDialog
+            from gui.app import MainWindow, ShortcutDialog, InstallDialog, UpdateWindow
             from gui.lock import LockWindow
             _app = QApplication.instance() or QApplication([])
             _w = MainWindow()
             _lk = LockWindow(60, guard_on=False, block_tm=False, _test=True)
             ShortcutDialog(_w, _w.home)      # 自定义快捷对话框
             InstallDialog(_w)                # 安装（选路径）对话框
+            UpdateWindow()                   # 发现更新窗
+            _w.plugin_api.info("selftest")   # 插件提示走 Qt（不崩即可）
             print("GUI_OK", _w.metaObject().className(), _lk.metaObject().className())
         except Exception as _e:
             print("GUI_FAIL:", repr(_e))
@@ -2528,6 +2534,13 @@ def main():
             # 不再要求先关更新窗才出启动器。启动器是另一个（已提权）进程，先拉起它；
             # 「发现更新」窗随后多抢几次前台，稳定叠在启动器之上（见 show_update_window）。
             _run(["schtasks", "/run", "/tn", TASK_OPEN])
+            if _qt_available():                       # qt 版：弹 Qt「发现更新」窗
+                try:
+                    from gui.app import run_update_prompt
+                    run_update_prompt()
+                    return
+                except Exception:
+                    _log("Qt 更新窗启动失败，回退：\n" + traceback.format_exc())
             if HAS_CTK:
                 app = App()
                 app.show_update_window()
