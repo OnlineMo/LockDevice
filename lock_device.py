@@ -31,8 +31,14 @@ import subprocess
 import traceback
 import importlib.util
 import types
-import tkinter as tk
-from tkinter import messagebox
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+    HAS_TK = True
+except Exception:              # qt 变体不打包 tkinter：本体仍需能加载（走 Qt 路径）
+    tk = None
+    messagebox = None
+    HAS_TK = False
 
 try:
     import customtkinter as ctk
@@ -72,6 +78,7 @@ VERSION = "1.5.0"    # 版本号（发布新版前在这里递增；更新识别
 CHANGELOG = {
     "1.5.0": [
         "界面重构：新增 PySide6 + qfluentwidgets 的 Fluent 现代界面（gui/ 文件夹）；本体自动识别——有 gui/ 且装了 Qt 库就用 Qt，否则回退经典 tkinter。功能对齐：专注锁定 / 插件 / 插件管理 / 安装卸载 / 更新",
+        "Qt 原生锁屏：模式一在 Qt 版用 Qt 全屏黑幕（时钟 / 大倒计时 / 息屏 / 关机），复用键盘拦截与看门狗互守；qt 变体彻底不打包 tkinter，体积更小。tkinter 版仍用自带锁屏，可单文件运行。",
         "打包：一次产出 4 个变体——tk 无插件（最小）/ tk 全插件 / qt 全插件 / qt 无插件；发布页可按需下载",
         "修复：从 Qt / 计划任务 / 自启拉起的一次性锁定（--startlock），锁定结束后进程直接退出，不再多弹一个 tkinter 主界面",
     ],
@@ -268,12 +275,13 @@ def _log(msg):
 
 
 def _dialog(title, text, kind="info"):
-    """在无主窗口场景下弹个消息框（用于 --install / --uninstall / 缺依赖 等）。"""
-    r = tk.Tk()
-    r.withdraw()
-    {"info": messagebox.showinfo, "error": messagebox.showerror,
-     "warn": messagebox.showwarning}[kind](title, text)
-    r.destroy()
+    """无主窗口场景弹个原生消息框（用于 --install / --uninstall / 缺依赖 等）。
+    用 Win32 MessageBoxW，不依赖 tkinter —— qt 变体不打包 tk 也能用。"""
+    icon = {"info": 0x40, "warn": 0x30, "error": 0x10}.get(kind, 0x40)
+    try:
+        ctypes.windll.user32.MessageBoxW(0, str(text), str(title), icon)
+    except Exception:
+        _log(f"[dialog:{kind}] {title}: {text}")
 
 
 # ------------------------------------------------------------------ 配置持久化
@@ -2305,6 +2313,20 @@ class App:
         # 模式二由关机任务负责
 
 
+def _clear_stale_lock():
+    """无活跃锁定时清理残留：让 vbs 看门狗自退、杀看门狗、复位运行态（保留设置）。tk-free。"""
+    try:
+        os.remove(_locker_pidfile())
+    except OSError:
+        pass
+    _kill_pid(_read_pidfile(_watchdog_pidfile()))
+    try:
+        os.remove(_watchdog_pidfile())
+    except OSError:
+        pass
+    clear_lock_state()
+
+
 # ------------------------------------------------------------------ 入口
 def main():
     argv = sys.argv[1:]
@@ -2370,7 +2392,17 @@ def main():
                 watched_by = int(argv[argv.index("--watched-by") + 1])
             except (IndexError, ValueError):
                 watched_by = None
-        app = App()
+        cfg = load_config()
+        lu = cfg.get("lock_until")
+        active = cfg.get("mode", 1) == 1 and lu and time.time() < lu
+        if active and _qt_available():          # qt 版：Qt 锁屏恢复
+            from gui.lock import run_lock
+            run_lock(int(lu - time.time()), resumed=True, watched_by=watched_by)
+            return
+        if not active:                          # 无活跃锁定：tk-free 清理即可
+            _clear_stale_lock()
+            return
+        app = App()                             # tk 版：活跃锁定 → tkinter 恢复
         app.watchdog_pid = watched_by
         app.resume_or_exit()
         return
@@ -2380,20 +2412,33 @@ def main():
             secs = int(argv[argv.index("--startlock") + 1])
         except (IndexError, ValueError):
             return
+        if _qt_available():                     # qt 版：Qt 原生全屏锁屏（不碰 tkinter）
+            from gui.lock import run_lock
+            run_lock(secs)
+            return
         app = App()
         app.oneshot = True          # 一次性锁定（Qt/自启/计划任务拉起）：结束后进程退出，不弹 tkinter 界面
         app.start_mode1_lock(secs, confirmed=True)
         app.run()
         return
 
-    if "--startshutdown" in argv:   # 提权后一步直达：直接创建「登录前关机」计划
+    if "--startshutdown" in argv:   # 提权后一步直达：直接创建「登录前关机」计划（tk-free，不建 GUI）
         try:
             mins = int(argv[argv.index("--startshutdown") + 1])
         except (IndexError, ValueError):
             return
-        app = App()
-        app.root.withdraw()
-        app.start_mode2_lock(mins, preboot=True, confirmed=True)
+        end = time.time() + mins * 60
+        ok, msg = create_shutdown_task(end, True)
+        if ok:
+            cfg = load_config()
+            cfg["mode"] = 2
+            cfg["lock_until"] = end
+            save_config(cfg)
+            instant = bool(cfg.get("mode2_instant", False))
+            do_shutdown(0 if instant else SHUTDOWN_DELAY,
+                        "LockDevice：电脑即将关机，请保存文件")
+        else:
+            _dialog("创建关机任务失败", msg or "未知错误", "error")
         return
 
     if "--plugin-boot" in argv:   # 插件开机自启任务触发 → 调各声明需要自启的插件 on_boot
@@ -2431,14 +2476,16 @@ def main():
         print("qt" if _qt_available() else "tk")
         return
 
-    if "--selftest" in argv:       # 诊断：离屏构造 Qt 主窗口，验证瘦身后 Qt 库/qfluentwidgets 资源齐全（无需显示器）
+    if "--selftest" in argv:       # 诊断：离屏构造 Qt 主窗口 + Qt 锁屏，验证瘦身后 Qt 库/资源齐全（无需显示器）
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         try:
             from PySide6.QtWidgets import QApplication
             from gui.app import MainWindow
+            from gui.lock import LockWindow
             _app = QApplication.instance() or QApplication([])
             _w = MainWindow()
-            print("GUI_OK", _w.metaObject().className())
+            _lk = LockWindow(60, guard_on=False, block_tm=False, _test=True)
+            print("GUI_OK", _w.metaObject().className(), _lk.metaObject().className())
         except Exception as _e:
             print("GUI_FAIL:", repr(_e))
         return

@@ -142,8 +142,11 @@ def build_one(suffix, with_gui, with_plugins, desc):
     a = [PY, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
          "--name", NAME, "--version-file", VER_FILE]
     if with_gui:    # Qt 现代界面：只收 gui 模块 + qfluentwidgets 资源；PySide6 交给自动分析（不 collect-all）
-        a += ["--hidden-import", "gui.app", "--collect-all", "qfluentwidgets",
-              "--exclude-module", "customtkinter"]   # 不带 customtkinter（HAS_CTK→False，模式一锁屏用原生 tkinter）
+        a += ["--hidden-import", "gui.app", "--hidden-import", "gui.lock",
+              "--collect-all", "qfluentwidgets",
+              # qt 版彻底不含 tk：模式一锁屏走 gui.lock（Qt 原生），故排除 customtkinter 与 tkinter 本身
+              "--exclude-module", "customtkinter",
+              "--exclude-module", "tkinter", "--exclude-module", "_tkinter"]
         # qfluentwidgets 是纯 QWidget 组件，排除这些重型 Qt 模块（仅 WebEngine 就上百 MB）→ 大幅瘦身
         for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick", "QtWebChannel",
                   "QtQml", "QtQuick", "QtQuick3D", "QtQuickWidgets", "QtQuickControls2",
