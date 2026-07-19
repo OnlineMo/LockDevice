@@ -66,10 +66,13 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.4.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.4.1"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.4.1": [
+        "修复：自动锁机改为「每日时间窗口」——不再用定时任务在固定点直接触发固定时长的锁定；改由插件在每次登录时自己检查：在窗口内就锁「剩余时间」（迟到开机只锁剩下的），过点开机则不锁（该插件因此改为需要开机自启）",
+    ],
     "1.4.0": [
         "插件系统：新增 plugins/ 目录，自动识别并加入插件（打包默认包含所有插件）；主页每个插件一个按钮 + 统一「⚙ 设置」页（与本体共用 config.json、按插件分区）；本体暴露锁机等函数供插件调用，插件与本体分离、独立演进",
         "界面：启动器主按钮更名为「🎯 专注锁定」（绿色运行 / 已安装打开 两处）",
@@ -646,21 +649,6 @@ def _find_plugin(pid):
     return None, None
 
 
-def _daily_trigger(hh, mm):
-    """每天 hh:mm 触发（CalendarTrigger + ScheduleByDay，间隔 1 天）。日期用今天、时间用 hh:mm。"""
-    lt = time.localtime()
-    start = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}T{int(hh):02d}:{int(mm):02d}:00"
-    return "\n".join([
-        "    <CalendarTrigger>",
-        f"      <StartBoundary>{start}</StartBoundary>",
-        "      <Enabled>true</Enabled>",
-        "      <ScheduleByDay>",
-        "        <DaysInterval>1</DaysInterval>",
-        "      </ScheduleByDay>",
-        "    </CalendarTrigger>",
-    ])
-
-
 def _sync_plugin_autostart():
     """按 config.plugins_autostart 记账建/删共享的插件开机自启任务（登录触发·当前用户·免 UAC）。"""
     if bool(load_config().get("plugins_autostart")):
@@ -691,27 +679,23 @@ def _build_plugin_api(app=None):
         save_config(cfg)
         _sync_plugin_autostart()
 
-    def register_task(name, trigger_xml, extra_args, **kw):
-        kw.setdefault("run_level", "LeastPrivilege")   # 默认当前用户·最低权限，免 UAC
-        kw.setdefault("system", False)
-        kw.setdefault("on_demand", False)
-        kw.setdefault("desc", "LockDevice 插件任务")
-        cmd, args = _action_for(extra_args)
-        return _register_task(name, _task_xml(trigger_xml, cmd, args, **kw))
-
-    def lock_command(minutes, mode=1):
-        # 复用本体锁机：返回计划任务动作参数（模式一全屏锁 / 模式二定时关机）
-        if int(mode) == 2:
-            return f"--startshutdown {int(minutes)}"
-        return f"--startlock {int(minutes) * 60}"
-
     def start_lock(minutes, mode=1):
-        if app is None:
+        secs = int(minutes) * 60
+        if app is not None:   # GUI 上下文：直接开锁
+            if int(mode) == 2:
+                app.start_mode2_lock(int(minutes))
+            else:
+                app.start_mode1_lock(secs)
             return
-        if int(mode) == 2:
-            app.start_mode2_lock(int(minutes))
-        else:
-            app.start_mode1_lock(int(minutes) * 60)
+        # CLI 上下文（如 --plugin-boot 登录检查）：拉起新进程锁定（复用 --startlock/--startshutdown）
+        cli = ["--startshutdown", str(int(minutes))] if int(mode) == 2 else ["--startlock", str(secs)]
+        if DRY_RUN:
+            _log("[DRY] plugin start_lock -> " + " ".join(cli))
+            return
+        try:
+            subprocess.Popen(_app_cmd(*cli), creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            _log("plugin start_lock 拉起失败\n" + traceback.format_exc())
 
     def info(msg, title="LockDevice"):
         if app is not None and not DRY_RUN:
@@ -730,14 +714,19 @@ def _build_plugin_api(app=None):
         else:
             _log(f"[plugin ERROR] {msg}")
 
-    # 只暴露「后端能力 + 工具箱无关的对话框」——界面全由本体按插件声明的 SETTINGS/ACTIONS 渲染，
-    # 插件不碰任何 GUI 组件。这样以后本体从 tkinter 换成 Qt，插件零改动。
+    def run_admin(plugin_id, *args):
+        """让插件继承本体的管理员权限：已是管理员 → 返回 True（插件当场做需提权的事）；
+        否则提权重启并回调该插件 handle_cli（--plugin <id> ...），返回是否已发起提权。"""
+        if is_admin():
+            return True
+        return relaunch_as_admin(" ".join(["--plugin", str(plugin_id), *[str(a) for a in args]]))
+
+    # 本体对插件只提供三类核心能力：**锁机**(start_lock) + **唤醒插件**(set_autostart → 登录回调 on_boot)
+    # + **提权**(is_admin / run_admin，让插件继承本体管理员权限)；外加配置存取 / 对话框 / 环境信息 等支持。
+    # 功能逻辑（何时锁、锁多久…）全在插件自己。界面由本体按 SETTINGS/ACTIONS 渲染（换 Qt 插件零改动）。
     return types.SimpleNamespace(
         get_settings=get_settings, save_settings=save_settings, set_autostart=set_autostart,
-        register_task=register_task, delete_task=_delete_task, task_exists=_task_exists,
-        daily_trigger=_daily_trigger, action_for=_action_for,
-        lock_command=lock_command, start_lock=start_lock,
-        is_admin=is_admin, is_installed=is_installed, relaunch_as_admin=relaunch_as_admin,
+        start_lock=start_lock, is_admin=is_admin, run_admin=run_admin, is_installed=is_installed,
         DRY_RUN=DRY_RUN, VERSION=VERSION, log=_log,
         info=info, confirm=confirm, error=error)
 
