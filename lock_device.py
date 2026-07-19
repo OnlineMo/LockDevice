@@ -66,10 +66,13 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.4.1"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.4.2"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.4.2": [
+        "插件系统：支持启用/关闭各插件（关闭的插件不加载运行、不占按钮、开机也不唤醒）；配置存 plugins_disabled",
+    ],
     "1.4.1": [
         "修复：自动锁机改为「每日时间窗口」——不再用定时任务在固定点直接触发固定时长的锁定；改由插件在每次登录时自己检查：在窗口内就锁「剩余时间」（迟到开机只锁剩下的），过点开机则不锁（该插件因此改为需要开机自启）",
     ],
@@ -140,7 +143,7 @@ TASK_UNINSTALL = "LockDevice_Uninstall" # 按需卸载（提权免 UAC）
 DEFAULT_CONFIG = {"mode": 1, "minutes": 30, "lock_until": None, "guard": True,
                   "block_taskmgr": False, "mode2_preboot": False, "mode2_instant": False,
                   "shortcuts": [], "skip_version": None,
-                  "plugins": {}, "plugins_autostart": []}
+                  "plugins": {}, "plugins_autostart": [], "plugins_disabled": []}
 
 # 界面配色
 FONT = "Microsoft YaHei"
@@ -647,6 +650,17 @@ def _find_plugin(pid):
         if meta.get("id") == pid:
             return meta, mod
     return None, None
+
+
+def plugin_disabled(pid):
+    return pid in load_config().get("plugins_disabled", [])
+
+
+def active_plugins():
+    """已启用（未被用户关闭）的插件。用于启动器按钮 / 设置 / 开机自启等「生效」场景；
+    管理页要列全部请用 load_plugins()。"""
+    dis = load_config().get("plugins_disabled", [])
+    return [(m, mod) for m, mod in load_plugins() if m.get("id") not in dis]
 
 
 def _sync_plugin_autostart():
@@ -1395,7 +1409,7 @@ class App:
         self._btn(c, "🎯   专注锁定", self.show_main, COL_GREEN).pack(fill="x", pady=6)
         # 每个已识别插件一个按钮（插件只声明 SETTINGS/ACTIONS，本体渲染其单页）+ 统一「设置」入口。
         # 两模式都显示；插件多了改用 CTkScrollableFrame
-        plugins = load_plugins()
+        plugins = active_plugins()
         for meta, mod in plugins:
             if getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None):
                 label = meta.get("button") or meta.get("name") or meta.get("id")
@@ -1403,6 +1417,8 @@ class App:
                           COL_BLUE).pack(fill="x", pady=6)
         if any(getattr(mod, "SETTINGS", None) for _m, mod in plugins):
             self._btn(c, "⚙   设置", self.show_settings, COL_GRAY).pack(fill="x", pady=6)
+        if load_plugins():
+            self._btn(c, "🧩  插件管理（启用/关闭）", self.show_plugin_manage, COL_GRAY).pack(fill="x", pady=6)
         # 次要操作
         if installed:
             self._btn(c, "✖   卸载", self.on_uninstall, COL_RED).pack(fill="x", pady=6)
@@ -1428,7 +1444,7 @@ class App:
         box = ctk.CTkScrollableFrame(c, fg_color="transparent")
         box.pack(side="top", fill="both", expand=True)
         self._settings_vars = []   # [(pid, key, type, tk_var)]
-        plugins = [(m, mod) for m, mod in load_plugins() if getattr(mod, "SETTINGS", None)]
+        plugins = [(m, mod) for m, mod in active_plugins() if getattr(mod, "SETTINGS", None)]
         if not plugins:
             ctk.CTkLabel(box, text="（暂无可配置的插件）", text_color="gray").pack(pady=10)
         self._render_plugin_settings(box, plugins)
@@ -1516,6 +1532,55 @@ class App:
                 self._btn(box, act.get("label", act.get("fn", "")),
                           (lambda f=fn: f(self.plugin_api)), COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
         self._bring_to_front()
+
+    # ---------------- 插件管理（启用/关闭） ----------------
+    def show_plugin_manage(self):
+        self.root.deiconify()
+        c = self._clear()
+        ctk.CTkLabel(c, text="🧩  插件管理", font=(FONT, 20, "bold")).pack(pady=(4, 2))
+        ctk.CTkLabel(c, text="开关启用 / 关闭插件（关闭后不加载运行、开机也不唤醒）",
+                     text_color="gray", font=(FONT, 11)).pack(pady=(0, 8))
+        bottom = ctk.CTkFrame(c, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", pady=(6, 0))
+        ctk.CTkButton(bottom, text="←  返回", fg_color=COL_GRAY,
+                      command=self.show_launcher).pack(fill="x")
+        box = ctk.CTkScrollableFrame(c, fg_color="transparent")
+        box.pack(side="top", fill="both", expand=True)
+        allp = load_plugins()
+        if not allp:
+            ctk.CTkLabel(box, text="（plugins/ 下暂无插件）", text_color="gray").pack(pady=10)
+        dis = load_config().get("plugins_disabled", [])
+        for meta, mod in allp:
+            pid = meta["id"]
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=4)
+            var = tk.BooleanVar(value=(pid not in dis))
+            ctk.CTkLabel(row, text=f"{meta.get('name', pid)}  ·  v{meta.get('version', '')}",
+                         anchor="w", font=(FONT, 13)).pack(side="left", fill="x", expand=True)
+            ctk.CTkSwitch(row, text="", variable=var,
+                          command=lambda p=pid, m=mod, v=var: self._toggle_plugin(p, m, v.get())).pack(side="right")
+        self._bring_to_front()
+
+    def _toggle_plugin(self, pid, mod, on):
+        cfg = load_config()
+        dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
+        if on:
+            cfg["plugins_disabled"] = dis
+            save_config(cfg)
+            if hasattr(mod, "on_settings_saved"):
+                try:
+                    mod.on_settings_saved(self.plugin_api, dict(cfg.get("plugins", {}).get(pid, {})))
+                except Exception:
+                    _log("on_settings_saved 失败\n" + traceback.format_exc())
+        else:
+            dis.append(pid)
+            cfg["plugins_disabled"] = dis
+            save_config(cfg)
+            if hasattr(mod, "on_uninstall"):
+                try:
+                    mod.on_uninstall(self.plugin_api)
+                except Exception:
+                    _log("on_uninstall 失败\n" + traceback.format_exc())
 
     def on_install(self):
         self._install_dialog()
@@ -2316,6 +2381,8 @@ def main():
     if "--plugin-boot" in argv:   # 插件开机自启任务触发 → 调各声明需要自启的插件 on_boot
         api = _build_plugin_api(None)
         for pid in load_config().get("plugins_autostart", []):
+            if plugin_disabled(pid):
+                continue
             _m, mod = _find_plugin(pid)
             if mod is not None and hasattr(mod, "on_boot"):
                 try:
