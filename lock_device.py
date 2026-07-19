@@ -2480,11 +2480,13 @@ def main():
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         try:
             from PySide6.QtWidgets import QApplication
-            from gui.app import MainWindow
+            from gui.app import MainWindow, ShortcutDialog, InstallDialog
             from gui.lock import LockWindow
             _app = QApplication.instance() or QApplication([])
             _w = MainWindow()
             _lk = LockWindow(60, guard_on=False, block_tm=False, _test=True)
+            ShortcutDialog(_w, _w.home)      # 自定义快捷对话框
+            InstallDialog(_w)                # 安装（选路径）对话框
             print("GUI_OK", _w.metaObject().className(), _lk.metaObject().className())
         except Exception as _e:
             print("GUI_FAIL:", repr(_e))

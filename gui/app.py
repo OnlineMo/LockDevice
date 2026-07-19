@@ -12,12 +12,13 @@ import sys
 import time
 import subprocess
 
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFileDialog)
 from PySide6.QtGui import QIcon
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
                             setTheme, Theme, TitleLabel, SubtitleLabel, BodyLabel,
                             PrimaryPushButton, PushButton, SpinBox, SwitchButton, ComboBox,
                             LineEdit, InfoBar, InfoBarPosition, ScrollArea, MessageBox,
+                            MessageBoxBase, CheckBox,
                             SettingCardGroup, SwitchSettingCard, PushSettingCard,
                             PrimaryPushSettingCard)
 
@@ -127,6 +128,93 @@ def _save_fields(win, fields):
     InfoBar.success("已保存", "设置已保存", parent=win, position=InfoBarPosition.TOP)
 
 
+# ---------------------------------------------------------------- 对话框：添加快捷 / 安装
+class ShortcutDialog(MessageBoxBase):
+    """添加「自定义快捷」——记住 时长 / 模式 / 附加开关，单击一键启动。"""
+
+    def __init__(self, parent, home):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel("添加快捷"))
+        self.label = LineEdit()
+        self.label.setPlaceholderText("标签（可选，不填自动生成）")
+        self.viewLayout.addWidget(self.label)
+        self.minutes = SpinBox()
+        self.minutes.setRange(1, 24 * 60)
+        self.minutes.setValue(int(home.minutes.value()))
+        _row(self.viewLayout, "时长（分钟）", self.minutes)
+        self.mode = ComboBox()
+        self.mode.addItems(["① 全屏锁定（软）", "② 定时关机（硬）"])
+        self.mode.setCurrentIndex(home.mode.currentIndex())
+        _row(self.viewLayout, "锁定方式", self.mode)
+        self.guard = SwitchButton()
+        self.guard.setChecked(home.guard.switchButton.isChecked())
+        self.block = SwitchButton()
+        self.block.setChecked(home.block.switchButton.isChecked())
+        self.preboot = SwitchButton()
+        self.preboot.setChecked(home.preboot.switchButton.isChecked())
+        self.instant = SwitchButton()
+        self.instant.setChecked(home.instant.switchButton.isChecked())
+        _row(self.viewLayout, "🛡 防止结束进程", self.guard)
+        _row(self.viewLayout, "🚫 禁用任务管理器", self.block)
+        _row(self.viewLayout, "🛡 登录前关机", self.preboot)
+        _row(self.viewLayout, "⚡ 开始后立即关机", self.instant)
+        self.mode.currentIndexChanged.connect(self._sync)
+        self._sync()
+        self.yesButton.setText("添加")
+        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(380)
+
+    def _sync(self):
+        m1 = self.mode.currentIndex() == 0
+        self.guard.setEnabled(m1)
+        self.block.setEnabled(m1)
+        self.preboot.setEnabled(not m1)
+        self.instant.setEnabled(not m1)
+
+    def values(self):
+        return {"label": self.label.text().strip(), "minutes": int(self.minutes.value()),
+                "mode": 2 if self.mode.currentIndex() == 1 else 1,
+                "guard": self.guard.isChecked(), "block_taskmgr": self.block.isChecked(),
+                "mode2_preboot": self.preboot.isChecked(), "mode2_instant": self.instant.isChecked()}
+
+
+class InstallDialog(MessageBoxBase):
+    """安装到本机：选择安装目录 + 桌面快捷 + 装后启动。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel("安装到本机"))
+        self.viewLayout.addWidget(BodyLabel("一次管理员授权 → 开机自启 / 此后免 UAC / 定时关机"))
+        self.viewLayout.addWidget(BodyLabel("安装位置"))
+        row = QHBoxLayout()
+        self.dir_edit = LineEdit()
+        self.dir_edit.setText(core.APP_DIR)
+        browse = PushButton("浏览…")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.dir_edit, 1)
+        row.addWidget(browse)
+        self.viewLayout.addLayout(row)
+        self.desktop = CheckBox("创建桌面快捷方式")
+        self.desktop.setChecked(True)
+        self.launch = CheckBox("安装后立即启动")
+        self.launch.setChecked(True)
+        self.viewLayout.addWidget(self.desktop)
+        self.viewLayout.addWidget(self.launch)
+        self.yesButton.setText("开始安装")
+        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(440)
+
+    def _browse(self):
+        base = os.path.dirname(self.dir_edit.text().rstrip("\\/")) or core.ROOT_DIR
+        picked = QFileDialog.getExistingDirectory(self, "选择安装位置", base)
+        if picked:
+            self.dir_edit.setText(os.path.join(picked, "LockDevice"))
+
+    def opts(self):
+        return {"dir": self.dir_edit.text().strip() or core.APP_DIR,
+                "desktop": self.desktop.isChecked(), "launch": self.launch.isChecked()}
+
+
 # ---------------------------------------------------------------- 专注锁定
 class HomeInterface(ScrollArea):
     def __init__(self, win):
@@ -161,6 +249,17 @@ class HomeInterface(ScrollArea):
         self.mode.currentIndexChanged.connect(self._sync)
         self._sync()
 
+        v.addWidget(BodyLabel("自定义快捷（单击一键启动）"))
+        self.sc_box = QWidget()
+        self.sc_lay = QVBoxLayout(self.sc_box)
+        self.sc_lay.setContentsMargins(0, 0, 0, 0)
+        self.sc_lay.setSpacing(6)
+        v.addWidget(self.sc_box)
+        add_sc = PushButton("＋ 添加快捷")
+        add_sc.clicked.connect(self._add_shortcut)
+        v.addWidget(add_sc)
+        self._render_shortcuts()
+
         v.addStretch(1)
         start = PrimaryPushButton("🔒  开始锁定")
         start.clicked.connect(self._start)
@@ -174,23 +273,84 @@ class HomeInterface(ScrollArea):
         self.instant.setEnabled(not m1)
 
     def _start(self):
+        self._do_start(2 if self.mode.currentIndex() == 1 else 1, int(self.minutes.value()),
+                       self.guard.switchButton.isChecked(), self.block.switchButton.isChecked(),
+                       self.preboot.switchButton.isChecked(), self.instant.switchButton.isChecked())
+
+    def _do_start(self, mode, minutes, guard, block_tm, preboot, instant):
         cfg = core.load_config()
-        cfg.update({
-            "mode": 2 if self.mode.currentIndex() == 1 else 1,
-            "minutes": int(self.minutes.value()),
-            "guard": self.guard.switchButton.isChecked(),
-            "block_taskmgr": self.block.switchButton.isChecked(),
-            "mode2_preboot": self.preboot.switchButton.isChecked(),
-            "mode2_instant": self.instant.switchButton.isChecked(),
-        })
+        cfg.update({"mode": mode, "minutes": minutes, "guard": guard, "block_taskmgr": block_tm,
+                    "mode2_preboot": preboot, "mode2_instant": instant})
         core.save_config(cfg)
-        minutes = cfg["minutes"]
-        if cfg["mode"] == 1:
+        if mode == 1:
             _spawn("--startlock", str(minutes * 60))
             InfoBar.success("已开始", f"全屏锁定 {minutes} 分钟", parent=self.win,
                             position=InfoBarPosition.TOP)
         else:
-            self._start_mode2(minutes, cfg["mode2_preboot"], cfg["mode2_instant"])
+            self._start_mode2(minutes, preboot, instant)
+
+    # ---- 自定义快捷（一键启动预设，与 tkinter 版共用 config["shortcuts"]）----
+    def _render_shortcuts(self):
+        while self.sc_lay.count():
+            it = self.sc_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+        scs = core.load_config().get("shortcuts", [])
+        if not scs:
+            self.sc_lay.addWidget(BodyLabel("（暂无，点下方「添加快捷」）"))
+            return
+        for i, sc in enumerate(scs):
+            mode = 2 if sc.get("mode") == 2 else 1
+            text = sc.get("label") or f"{'②定时关机' if mode == 2 else '①全屏锁定'} · {sc.get('minutes', 30)} 分钟"
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            go = PrimaryPushButton(text)
+            go.clicked.connect(lambda _=False, s=dict(sc): self._launch_shortcut(s))
+            dele = PushButton("删除")
+            dele.clicked.connect(lambda _=False, idx=i: self._del_shortcut(idx))
+            h.addWidget(go, 1)
+            h.addWidget(dele)
+            self.sc_lay.addWidget(row)
+
+    def _del_shortcut(self, idx):
+        cfg = core.load_config()
+        scs = list(cfg.get("shortcuts", []))
+        if 0 <= idx < len(scs):
+            del scs[idx]
+            cfg["shortcuts"] = scs
+            core.save_config(cfg)
+            self._render_shortcuts()
+
+    def _add_shortcut(self):
+        dlg = ShortcutDialog(self.win, self)
+        if not dlg.exec():
+            return
+        cfg = core.load_config()
+        scs = list(cfg.get("shortcuts", []))
+        scs.append(dlg.values())
+        cfg["shortcuts"] = scs
+        core.save_config(cfg)
+        self._render_shortcuts()
+
+    def _launch_shortcut(self, sc):
+        try:
+            minutes = int(sc.get("minutes", 30))
+        except (ValueError, TypeError):
+            return
+        mode = 2 if sc.get("mode") == 2 else 1
+        guard = bool(sc.get("guard", True))
+        block_tm = bool(sc.get("block_taskmgr", False))
+        preboot = bool(sc.get("mode2_preboot", False))
+        instant = bool(sc.get("mode2_instant", False))
+        self.mode.setCurrentIndex(1 if mode == 2 else 0)   # 同步到界面，让用户看到采用的设置
+        self.minutes.setValue(minutes)
+        self.guard.switchButton.setChecked(guard)
+        self.block.switchButton.setChecked(block_tm)
+        self.preboot.switchButton.setChecked(preboot)
+        self.instant.switchButton.setChecked(instant)
+        self._do_start(mode, minutes, guard, block_tm, preboot, instant)
 
     def _start_mode2(self, minutes, preboot, instant):
         kind = "登录前" if preboot else "登录后"
@@ -337,9 +497,22 @@ class SettingsInterface(ScrollArea):
         v.addStretch(1)
 
     def _install(self):
-        core.save_install_opts({"dir": core.APP_DIR, "desktop": True, "launch": True})
-        if core.relaunch_as_admin("--install"):
+        dlg = InstallDialog(self.win)
+        if not dlg.exec():
+            return
+        opts = dlg.opts()
+        core.save_install_opts(opts)
+        if core.DRY_RUN or core.is_admin():
+            ok, msg = core.do_install(opts["dir"], opts["desktop"], opts["launch"])
+            core.clear_install_opts()
+            (InfoBar.success if ok else InfoBar.error)(
+                "安装", msg, parent=self.win, position=InfoBarPosition.TOP)
+        elif core.relaunch_as_admin("--install"):
             self.win.close()
+        else:
+            core.clear_install_opts()
+            InfoBar.warning("已取消", "未获得管理员权限，安装取消。", parent=self.win,
+                            position=InfoBarPosition.TOP)
 
     def _uninstall(self):
         if MessageBox("卸载确认", "确定卸载 LockDevice？将删除计划任务、开机自启、快捷方式与安装文件。", self.win).exec():
