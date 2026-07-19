@@ -4,15 +4,15 @@
 复用本体 lock_device 的后端（配置 / 计划任务 / 插件 / 锁机 / 安装卸载），只重写前端。
 tkinter 版仍保留在 lock_device.py（可单文件独立运行）；本 Qt 版为增强前端。
 
-覆盖：专注锁定（模式一/二全部开关 + 开始）、插件（声明式渲染 + 动作 + 保存）、
-设置（安装/卸载/清除数据/更新 + 关于）。锁屏 Qt 化见 docs/GUI_QT_MIGRATION.md（下一步）。
+导航：专注锁定、每个启用的插件各一个入口、插件（开关管理）、设置（安装/卸载/清除/更新/关于）。
+锁屏 Qt 化见 docs/GUI_QT_MIGRATION.md（下一步）。
 """
 import os
 import sys
 import time
 import subprocess
 
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout)
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
                             setTheme, Theme, TitleLabel, SubtitleLabel, BodyLabel,
                             PrimaryPushButton, PushButton, SpinBox, SwitchButton, ComboBox,
@@ -20,7 +20,7 @@ from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as 
                             SettingCardGroup, SwitchSettingCard, PushSettingCard,
                             PrimaryPushSettingCard)
 
-import lock_device as core   # 复用本体后端（源码态直接 import；不触发 main）
+import lock_device as core
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -32,7 +32,6 @@ def _spawn(*args):
 
 
 def _themed_body(area, name):
-    """ScrollArea 透明背景（露出深色主题）+ 返回布局。"""
     area.setObjectName(name)
     area.setWidgetResizable(True)
     try:
@@ -61,6 +60,57 @@ def _row(v, label, widget):
     r.addWidget(widget)
     v.addLayout(r)
     return widget
+
+
+def _field(v, store, pid, f, vals):
+    """按声明渲染一个设置控件，把 (pid,key,type,getter) 追加进 store。"""
+    key, ftype = f["key"], f.get("type", "str")
+    cur = vals.get(key, f.get("default"))
+    if ftype == "bool":
+        wdg = SwitchButton()
+        wdg.setChecked(bool(cur))
+        getter = wdg.isChecked
+    elif ftype == "choice":
+        wdg = ComboBox()
+        opts = [str(o) for o in f.get("options", [])]
+        wdg.addItems(opts)
+        if cur is not None and str(cur) in opts:
+            wdg.setCurrentText(str(cur))
+        getter = wdg.currentText
+    else:
+        wdg = LineEdit()
+        wdg.setText("" if cur is None else str(cur))
+        wdg.setFixedWidth(180)
+        getter = wdg.text
+    _row(v, f.get("label", key), wdg)
+    store.append((pid, key, ftype, getter))
+
+
+def _save_fields(win, fields):
+    """把 fields 的值写回 config（按插件分区）并回调 on_settings_saved。"""
+    cfg = core.load_config()
+    cfg.setdefault("plugins", {})
+    touched = {}
+    for pid, key, ftype, getter in fields:
+        val = getter()
+        if ftype == "int":
+            try:
+                val = int(str(val).strip())
+            except (ValueError, TypeError):
+                val = 0
+        touched.setdefault(pid, {})[key] = val
+    for pid, vals in touched.items():
+        m = dict(cfg["plugins"].get(pid, {}))
+        m.update(vals)
+        cfg["plugins"][pid] = m
+    core.save_config(cfg)
+    for meta, mod in core.load_plugins():
+        if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
+            try:
+                mod.on_settings_saved(win.plugin_api, dict(cfg["plugins"].get(meta["id"], {})))
+            except Exception:
+                core._log("on_settings_saved 失败\n" + core.traceback.format_exc())
+    InfoBar.success("已保存", "设置已保存", parent=win, position=InfoBarPosition.TOP)
 
 
 # ---------------------------------------------------------------- 专注锁定
@@ -94,7 +144,6 @@ class HomeInterface(ScrollArea):
         for c in (self.guard, self.block, self.preboot, self.instant):
             grp.addSettingCard(c)
         v.addWidget(grp)
-
         self.mode.currentIndexChanged.connect(self._sync)
         self._sync()
 
@@ -110,7 +159,7 @@ class HomeInterface(ScrollArea):
         self.preboot.setEnabled(not m1)
         self.instant.setEnabled(not m1)
 
-    def _collect(self):
+    def _start(self):
         cfg = core.load_config()
         cfg.update({
             "mode": 2 if self.mode.currentIndex() == 1 else 1,
@@ -121,10 +170,6 @@ class HomeInterface(ScrollArea):
             "mode2_instant": self.instant.switchButton.isChecked(),
         })
         core.save_config(cfg)
-        return cfg
-
-    def _start(self):
-        cfg = self._collect()
         minutes = cfg["minutes"]
         if cfg["mode"] == 1:
             _spawn("--startlock", str(minutes * 60))
@@ -138,11 +183,9 @@ class HomeInterface(ScrollArea):
         first = "立即关机、不留缓冲" if instant else f"约 {core.SHUTDOWN_DELAY} 秒后关机"
         box = MessageBox(
             "⚠️ 高风险确认",
-            f"【定时关机 · {kind}】将会：\n"
-            f"1. {first}（请先保存文件）\n"
+            f"【定时关机 · {kind}】将会：\n1. {first}（请先保存文件）\n"
             f"2. 未来 {minutes} 分钟内每次{'开机(登录前)' if preboot else '登录后'}自动关机\n"
-            f"3. 到点自动解除\n\n紧急恢复：开机进安全模式解除。确定继续吗？",
-            self.win)
+            f"3. 到点自动解除\n\n紧急恢复：开机进安全模式解除。确定继续吗？", self.win)
         if not box.exec():
             return
         if preboot and not core.is_admin() and not core.DRY_RUN:
@@ -162,61 +205,31 @@ class HomeInterface(ScrollArea):
         core.do_shutdown(0 if instant else core.SHUTDOWN_DELAY, "LockDevice：电脑即将关机，请保存文件")
 
 
-# ---------------------------------------------------------------- 插件
-class PluginsInterface(ScrollArea):
-    def __init__(self, win):
+# ---------------------------------------------------------------- 每个插件一页
+class PluginPageInterface(ScrollArea):
+    def __init__(self, win, meta, mod):
         super().__init__()
         self.win = win
-        v = _themed_body(self, "plugins")
-        v.addWidget(TitleLabel("插件"))
-        self._fields = []   # (pid, key, type, getter)
-        cfg = core.load_config()
-        plugins = core.load_plugins()
-        shown = 0
-        for meta, mod in plugins:
-            if not (getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None)):
-                continue
-            shown += 1
-            pid = meta["id"]
-            vals = cfg.get("plugins", {}).get(pid, {})
-            v.addWidget(SubtitleLabel(f"{meta.get('name', pid)}  ·  v{meta.get('version', '')}"))
-            for f in getattr(mod, "SETTINGS", []):
-                self._field(v, pid, f, vals)
-            for act in getattr(mod, "ACTIONS", []) or []:
-                fn = getattr(mod, act.get("fn", ""), None)
-                if callable(fn):
-                    b = PushButton(act.get("label", act.get("fn", "")))
-                    b.clicked.connect(lambda _=False, f=fn: self._action(f))
-                    v.addWidget(b)
-        if not shown:
-            v.addWidget(BodyLabel("（暂无插件）"))
+        self.meta = meta
+        self.mod = mod
+        v = _themed_body(self, "plugin_" + meta["id"])
+        v.addWidget(TitleLabel(meta.get("name", meta["id"])))
+        v.addWidget(BodyLabel(f"v{meta.get('version', '')}"))
+        self._fields = []
+        vals = core.load_config().get("plugins", {}).get(meta["id"], {})
+        for f in getattr(mod, "SETTINGS", []):
+            _field(v, self._fields, meta["id"], f, vals)
+        for act in getattr(mod, "ACTIONS", []) or []:
+            fn = getattr(mod, act.get("fn", ""), None)
+            if callable(fn):
+                b = PushButton(act.get("label", act.get("fn", "")))
+                b.clicked.connect(lambda _=False, f=fn: self._action(f))
+                v.addWidget(b)
         v.addStretch(1)
-        if shown:
+        if getattr(mod, "SETTINGS", None):
             save = PrimaryPushButton("💾  保存")
-            save.clicked.connect(self._save)
+            save.clicked.connect(lambda: _save_fields(self.win, self._fields))
             v.addWidget(save)
-
-    def _field(self, v, pid, f, vals):
-        key, ftype = f["key"], f.get("type", "str")
-        cur = vals.get(key, f.get("default"))
-        if ftype == "bool":
-            wdg = SwitchButton()
-            wdg.setChecked(bool(cur))
-            getter = wdg.isChecked
-        elif ftype == "choice":
-            wdg = ComboBox()
-            opts = [str(o) for o in f.get("options", [])]
-            wdg.addItems(opts)
-            if cur is not None and str(cur) in opts:
-                wdg.setCurrentText(str(cur))
-            getter = wdg.currentText
-        else:
-            wdg = LineEdit()
-            wdg.setText("" if cur is None else str(cur))
-            wdg.setFixedWidth(180)
-            getter = wdg.text
-        _row(v, f.get("label", key), wdg)
-        self._fields.append((pid, key, ftype, getter))
 
     def _action(self, fn):
         try:
@@ -224,31 +237,56 @@ class PluginsInterface(ScrollArea):
         except Exception:
             core._log("plugin action 失败\n" + core.traceback.format_exc())
 
-    def _save(self):
+
+# ---------------------------------------------------------------- 插件管理（开关）
+class PluginManageInterface(ScrollArea):
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        v = _themed_body(self, "pluginmanage")
+        v.addWidget(TitleLabel("插件"))
+        v.addWidget(BodyLabel("开关启用 / 关闭插件（关闭后不加载运行、开机也不唤醒；侧栏入口重启后更新）"))
+        allp = core.load_plugins()
+        if not allp:
+            v.addWidget(BodyLabel("（plugins/ 下暂无插件）"))
+        else:
+            grp = SettingCardGroup("已安装插件")
+            dis = core.load_config().get("plugins_disabled", [])
+            for meta, mod in allp:
+                pid = meta["id"]
+                card = SwitchSettingCard(FIF.APPLICATION, meta.get("name", pid),
+                                         f"v{meta.get('version', '')} · {pid}")
+                card.switchButton.setChecked(pid not in dis)
+                card.switchButton.checkedChanged.connect(
+                    lambda on, mt=meta, md=mod: self._toggle(mt, md, on))
+                grp.addSettingCard(card)
+            v.addWidget(grp)
+        v.addStretch(1)
+
+    def _toggle(self, meta, mod, on):
+        pid = meta["id"]
         cfg = core.load_config()
-        cfg.setdefault("plugins", {})
-        touched = {}
-        for pid, key, ftype, getter in self._fields:
-            val = getter()
-            if ftype == "int":
-                try:
-                    val = int(str(val).strip())
-                except (ValueError, TypeError):
-                    val = 0
-            touched.setdefault(pid, {})[key] = val
-        for pid, vals in touched.items():
-            m = dict(cfg["plugins"].get(pid, {}))
-            m.update(vals)
-            cfg["plugins"][pid] = m
-        core.save_config(cfg)
+        dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
         api = self.win.plugin_api
-        for meta, mod in core.load_plugins():
-            if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
+        if on:
+            cfg["plugins_disabled"] = dis
+            core.save_config(cfg)
+            if hasattr(mod, "on_settings_saved"):
                 try:
-                    mod.on_settings_saved(api, dict(cfg["plugins"].get(meta["id"], {})))
+                    mod.on_settings_saved(api, dict(cfg.get("plugins", {}).get(pid, {})))
                 except Exception:
-                    core._log("on_settings_saved 失败\n" + core.traceback.format_exc())
-        InfoBar.success("已保存", "设置已保存", parent=self.win, position=InfoBarPosition.TOP)
+                    pass
+            self.win.add_plugin_nav(meta, mod)      # 立即加回侧栏入口
+        else:
+            dis.append(pid)
+            cfg["plugins_disabled"] = dis
+            core.save_config(cfg)
+            if hasattr(mod, "on_uninstall"):
+                try:
+                    mod.on_uninstall(api)           # 关闭时清掉它建的任务 / 自启
+                except Exception:
+                    pass
+            self.win.remove_plugin_nav(pid)         # 立即移除侧栏入口（不提示）
 
 
 # ---------------------------------------------------------------- 设置（本机管理）
@@ -260,11 +298,9 @@ class SettingsInterface(ScrollArea):
         v.addWidget(TitleLabel("设置"))
 
         grp = SettingCardGroup("本机")
-        installed = core.is_installed()
-        if installed:
+        if core.is_installed():
             if core.has_update():
-                up = PrimaryPushSettingCard("更新", FIF.UPDATE, f"更新到 v{core.VERSION}",
-                                            "原地覆盖、保留设置")
+                up = PrimaryPushSettingCard("更新", FIF.UPDATE, f"更新到 v{core.VERSION}", "原地覆盖、保留设置")
                 up.clicked.connect(self._update)
                 grp.addSettingCard(up)
             un = PushSettingCard("卸载", FIF.DELETE, "卸载 LockDevice", "删除任务 / 自启 / 快捷方式 / 安装文件")
@@ -324,15 +360,35 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.setWindowTitle("LockDevice · 专注锁定")
         self.resize(920, 640)
-        self.plugin_api = core._build_plugin_api(None)   # 插件动作用（无 tk App，仅后端能力）
+        self.plugin_api = core._build_plugin_api(None)
+        self.plugin_pages = {}
         self.home = HomeInterface(self)
         self.addSubInterface(self.home, FIF.HOME, "专注锁定")
-        if any(getattr(m, "SETTINGS", None) or getattr(m, "ACTIONS", None)
-               for _n, m in core.load_plugins()):
-            self.plugins = PluginsInterface(self)
-            self.addSubInterface(self.plugins, FIF.APPLICATION, "插件")
+        for meta, mod in core.active_plugins():
+            self.add_plugin_nav(meta, mod)
+        self.pmanage = PluginManageInterface(self)
+        self.addSubInterface(self.pmanage, FIF.APPLICATION, "插件", NavigationItemPosition.BOTTOM)
         self.settings = SettingsInterface(self)
         self.addSubInterface(self.settings, FIF.SETTING, "设置", NavigationItemPosition.BOTTOM)
+
+    def add_plugin_nav(self, meta, mod):
+        """给一个启用的插件加侧栏入口（幂等）。"""
+        if not (getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None)):
+            return
+        pid = meta["id"]
+        if pid in self.plugin_pages:
+            return
+        page = PluginPageInterface(self, meta, mod)
+        self.addSubInterface(page, FIF.APPLICATION, meta.get("button") or meta.get("name") or pid)
+        self.plugin_pages[pid] = page
+
+    def remove_plugin_nav(self, pid):
+        page = self.plugin_pages.pop(pid, None)
+        if page is not None:
+            try:
+                self.removeInterface(page)
+            except Exception:
+                pass
 
 
 def run():
