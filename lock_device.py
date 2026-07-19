@@ -66,10 +66,13 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.4.2"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.5.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.5.0": [
+        "界面重构：新增 PySide6 + qfluentwidgets 的 Fluent 现代界面（gui/ 文件夹）；本体自动识别——有 gui/ 且装了 Qt 库就用 Qt，否则回退经典 tkinter。功能对齐：专注锁定 / 插件 / 插件管理 / 安装卸载 / 更新",
+    ],
     "1.4.2": [
         "插件系统：支持启用/关闭各插件（关闭的插件不加载运行、不占按钮、开机也不唤醒）；配置存 plugins_disabled",
     ],
@@ -618,6 +621,22 @@ def _plugins_dir():
     else:
         base = os.path.dirname(_self_path())
     return os.path.join(base, "plugins")
+
+
+def _qt_available():
+    """有 gui 文件夹 且 PySide6 + qfluentwidgets 可用 → 用 Qt 界面；否则回退 tkinter。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(_self_path())
+    if not os.path.isdir(os.path.join(base, "gui")):
+        return False
+    try:
+        import PySide6            # noqa: F401
+        import qfluentwidgets     # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def load_plugins(force=False):
@@ -2432,6 +2451,13 @@ def main():
         # 正常同版本 / 已「跳过此版本」：转交已安装任务打开后退出（免 UAC，不再弹更新窗）
         if _run(["schtasks", "/run", "/tn", TASK_OPEN]).returncode == 0:
             return
+    if _qt_available():   # 有 gui 文件夹 + PySide6/qfluentwidgets → 用 Qt 现代界面
+        try:
+            from gui.app import run as _qt_run
+            _qt_run()
+            return
+        except Exception:
+            _log("Qt 界面启动失败，回退 tkinter：\n" + traceback.format_exc())
     if not HAS_CTK:
         _dialog("需要 customtkinter",
                 "本程序界面需要 customtkinter。\n请运行：\n\n    pip install customtkinter\n\n安装后重新打开。",
