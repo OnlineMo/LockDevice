@@ -72,6 +72,8 @@ VERSION = "1.5.0"    # 版本号（发布新版前在这里递增；更新识别
 CHANGELOG = {
     "1.5.0": [
         "界面重构：新增 PySide6 + qfluentwidgets 的 Fluent 现代界面（gui/ 文件夹）；本体自动识别——有 gui/ 且装了 Qt 库就用 Qt，否则回退经典 tkinter。功能对齐：专注锁定 / 插件 / 插件管理 / 安装卸载 / 更新",
+        "打包：一次产出 4 个变体——tk 无插件（最小）/ tk 全插件 / qt 全插件 / qt 无插件；发布页可按需下载",
+        "修复：从 Qt / 计划任务 / 自启拉起的一次性锁定（--startlock），锁定结束后进程直接退出，不再多弹一个 tkinter 主界面",
     ],
     "1.4.2": [
         "插件系统：支持启用/关闭各插件（关闭的插件不加载运行、不占按钮、开机也不唤醒）；配置存 plugins_disabled",
@@ -624,16 +626,12 @@ def _plugins_dir():
 
 
 def _qt_available():
-    """有 gui 文件夹 且 PySide6 + qfluentwidgets 可用 → 用 Qt 界面；否则回退 tkinter。"""
-    if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    else:
-        base = os.path.dirname(_self_path())
-    if not os.path.isdir(os.path.join(base, "gui")):
-        return False
+    """gui 界面包 + PySide6 + qfluentwidgets 都在 → 用 Qt；否则回退 tkinter。
+    直接试导入 gui.app 最稳（源码/冻结都适用）：能导入即用（随后 main 直接调 run）。"""
     try:
         import PySide6            # noqa: F401
         import qfluentwidgets     # noqa: F401
+        import gui.app            # noqa: F401
         return True
     except Exception:
         return False
@@ -2216,8 +2214,8 @@ class App:
         if self.lock_win and self.lock_win.winfo_exists():
             self.lock_win.destroy()
         self.lock_win = None
-        if self.resumed:
-            self.root.destroy()
+        if self.resumed or getattr(self, "oneshot", False):
+            self.root.destroy()     # 恢复态 / 一次性锁定（--startlock）：结束即退出，不再弹 tkinter 主界面
         else:
             messagebox.showinfo("完成", "锁定结束，专注辛苦啦！🎉")
             self.show_main()
@@ -2383,6 +2381,7 @@ def main():
         except (IndexError, ValueError):
             return
         app = App()
+        app.oneshot = True          # 一次性锁定（Qt/自启/计划任务拉起）：结束后进程退出，不弹 tkinter 界面
         app.start_mode1_lock(secs, confirmed=True)
         app.run()
         return
@@ -2426,6 +2425,10 @@ def main():
     if "--list-plugins" in argv:   # 诊断：打印已识别插件（也用于验证冻结态 _MEIPASS 加载）
         for meta, _mod in load_plugins():
             print(f"{meta.get('id')}\t{meta.get('name', '')}\tv{meta.get('version', '')}")
+        return
+
+    if "--gui-mode" in argv:       # 诊断：打印将采用的界面（qt / tk），验证冻结态自动切换
+        print("qt" if _qt_available() else "tk")
         return
 
     # --open（提权打开）或无参数：显示启动器

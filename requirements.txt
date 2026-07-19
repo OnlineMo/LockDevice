@@ -1,7 +1,8 @@
 # LockDevice 依赖 —— 不锁版本，每次都装最新（--upgrade）
-
-# 运行依赖：现代化界面（缺它后台仍可运行，但界面需要）
+# 经典 tkinter 界面（tk 变体 / 回退用）
 customtkinter
-
-# 打包依赖：构建单文件 exe
+# 现代 Qt 界面（本体检测到就用它；构建 qt 变体需要）
+PySide6
+PySide6-Fluent-Widgets
+# 打包
 pyinstaller
