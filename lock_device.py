@@ -72,10 +72,13 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.5.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.5.1"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.5.1": [
+        "插件热添加：exe 现在会扫描自身同目录的 plugins/ 文件夹——把插件 .py 丢进去、重启即识别（此前只认打包进 exe 的内置插件）；外置同名插件覆盖内置，可热更新。",
+    ],
     "1.5.0": [
         "界面重构：新增 PySide6 + qfluentwidgets 的 Fluent 现代界面（gui/ 文件夹）；本体自动识别——有 gui/ 且装了 Qt 库就用 Qt，否则回退经典 tkinter。功能对齐：专注锁定 / 插件 / 插件管理 / 安装卸载 / 更新",
         "Qt 原生锁屏：模式一在 Qt 版用 Qt 全屏黑幕（时钟 / 大倒计时 / 息屏 / 关机），复用键盘拦截与看门狗互守；qt 变体彻底不打包 tkinter，体积更小。tkinter 版仍用自带锁屏，可单文件运行。",
@@ -624,13 +627,24 @@ def create_boot_task():
 _PLUGINS_CACHE = None
 
 
-def _plugins_dir():
-    """插件目录：冻结态在 _MEIPASS 解包目录，源码态在脚本同级（复用 _icon_path 的定位模式）。"""
+def _plugins_dirs():
+    """插件目录（按加载顺序，去重）。冻结态：_MEIPASS/plugins（打包内置）+ exe 同级 plugins/
+    （用户把 .py 丢进去即热添加）；源码态：脚本同级 plugins/。存在与否由调用方判断。"""
+    dirs = []
     if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            dirs.append(os.path.join(meipass, "plugins"))                       # 打包内置
+        dirs.append(os.path.join(os.path.dirname(sys.executable), "plugins"))   # exe 同级：热添加
     else:
-        base = os.path.dirname(_self_path())
-    return os.path.join(base, "plugins")
+        dirs.append(os.path.join(os.path.dirname(_self_path()), "plugins"))
+    seen, out = set(), []
+    for d in dirs:
+        key = os.path.normcase(os.path.abspath(d))
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
 
 
 def _qt_available():
@@ -646,13 +660,15 @@ def _qt_available():
 
 
 def load_plugins(force=False):
-    """加载 plugins/*.py → [(meta, module), ...]。逐个隔离，坏插件只记日志、不影响其它。"""
+    """加载 plugins/*.py → [(meta, module), ...]。扫描内置 + exe 同级 plugins/（热添加），
+    外置同 id 覆盖内置。逐个隔离，坏插件只记日志、不影响其它。"""
     global _PLUGINS_CACHE
     if _PLUGINS_CACHE is not None and not force:
         return _PLUGINS_CACHE
-    out = []
-    d = _plugins_dir()
-    if d and os.path.isdir(d):
+    out, by_id = [], {}
+    for d in _plugins_dirs():
+        if not (d and os.path.isdir(d)):
+            continue
         for fn in sorted(os.listdir(d)):
             if not fn.endswith(".py") or fn.startswith("_"):
                 continue
@@ -663,7 +679,12 @@ def load_plugins(force=False):
                 spec.loader.exec_module(mod)
                 meta = getattr(mod, "PLUGIN", None)
                 if isinstance(meta, dict) and meta.get("id"):
-                    out.append((meta, mod))
+                    pid = meta["id"]
+                    if pid in by_id:            # exe 同级同 id 覆盖内置（支持热更新）
+                        out[by_id[pid]] = (meta, mod)
+                    else:
+                        by_id[pid] = len(out)
+                        out.append((meta, mod))
             except Exception:
                 _log("插件加载失败 " + fn + "\n" + traceback.format_exc())
     _PLUGINS_CACHE = out
