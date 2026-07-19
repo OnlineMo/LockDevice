@@ -640,7 +640,7 @@ class UpdateWindow(QWidget):
         area.setStyleSheet("QScrollArea{border:none;background:transparent}")
         inner = QWidget()
         il = QVBoxLayout(inner)
-        il.setContentsMargins(2, 2, 2, 2)
+        il.setContentsMargins(4, 2, 20, 2)   # 右侧留白给叠加式滚动条，免得遮住正文最后一个字
         logs = core.changelog_since(core.installed_version())
         if not logs:
             il.addWidget(BodyLabel("（本版本未附更新说明）"))
