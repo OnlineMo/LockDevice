@@ -10,7 +10,7 @@
 import sys
 import subprocess
 
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout)
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
                             setTheme, Theme, TitleLabel, SubtitleLabel, BodyLabel,
                             PrimaryPushButton, SpinBox, SwitchButton, ComboBox, LineEdit,
@@ -28,16 +28,27 @@ def _spawn(*args):
     subprocess.Popen(cmd, creationflags=_CREATE_NO_WINDOW)
 
 
-def _scroll(name):
-    area = ScrollArea()
+def _themed_body(area, name):
+    """把一个 ScrollArea 配成透明背景（露出窗口的主题深色，避免白底白字）+ 返回可用布局。"""
     area.setObjectName(name)
-    w = QWidget()
-    area.setWidget(w)
     area.setWidgetResizable(True)
-    v = QVBoxLayout(w)
-    v.setContentsMargins(36, 24, 36, 24)
-    v.setSpacing(14)
-    return area, v
+    try:
+        area.enableTransparentBackground()
+    except Exception:
+        pass
+    area.setStyleSheet("QScrollArea{border:none;background:transparent}")
+    try:
+        area.viewport().setStyleSheet("background:transparent")
+    except Exception:
+        pass
+    view = QWidget()
+    view.setObjectName(name + "View")
+    view.setStyleSheet(f"#{name}View{{background:transparent}}")
+    area.setWidget(view)
+    lay = QVBoxLayout(view)
+    lay.setContentsMargins(36, 24, 36, 24)
+    lay.setSpacing(14)
+    return lay
 
 
 def _row(v, label, widget):
@@ -53,13 +64,7 @@ class HomeInterface(ScrollArea):
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.setObjectName("home")
-        w = QWidget()
-        self.setWidget(w)
-        self.setWidgetResizable(True)
-        v = QVBoxLayout(w)
-        v.setContentsMargins(36, 24, 36, 24)
-        v.setSpacing(14)
+        v = _themed_body(self, "home")
         cfg = core.load_config()
 
         v.addWidget(TitleLabel("专注锁定"))
@@ -108,31 +113,25 @@ class SettingsInterface(ScrollArea):
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.setObjectName("settings")
-        w = QWidget()
-        self.setWidget(w)
-        self.setWidgetResizable(True)
-        self.v = QVBoxLayout(w)
-        self.v.setContentsMargins(36, 24, 36, 24)
-        self.v.setSpacing(12)
-        self.v.addWidget(TitleLabel("设置"))
+        v = _themed_body(self, "settings")
+        v.addWidget(TitleLabel("设置"))
         self._fields = []   # (pid, key, type, getter)
         cfg = core.load_config()
         plugins = [(m, mod) for m, mod in core.load_plugins() if getattr(mod, "SETTINGS", None)]
         if not plugins:
-            self.v.addWidget(BodyLabel("（暂无可配置的插件）"))
+            v.addWidget(BodyLabel("（暂无可配置的插件）"))
         for meta, mod in plugins:
             pid = meta["id"]
             vals = cfg.get("plugins", {}).get(pid, {})
-            self.v.addWidget(SubtitleLabel(meta.get("name", pid)))
+            v.addWidget(SubtitleLabel(meta.get("name", pid)))
             for f in mod.SETTINGS:
-                self._field(pid, f, vals)
-        self.v.addStretch(1)
+                self._field(v, pid, f, vals)
+        v.addStretch(1)
         save = PrimaryPushButton("💾  保存")
         save.clicked.connect(self._save)
-        self.v.addWidget(save)
+        v.addWidget(save)
 
-    def _field(self, pid, f, vals):
+    def _field(self, v, pid, f, vals):
         key, ftype = f["key"], f.get("type", "str")
         cur = vals.get(key, f.get("default"))
         if ftype == "bool":
@@ -151,7 +150,7 @@ class SettingsInterface(ScrollArea):
             wdg.setText("" if cur is None else str(cur))
             wdg.setFixedWidth(180)
             getter = wdg.text
-        _row(self.v, f.get("label", key), wdg)
+        _row(v, f.get("label", key), wdg)
         self._fields.append((pid, key, ftype, getter))
 
     def _save(self):
@@ -159,13 +158,13 @@ class SettingsInterface(ScrollArea):
         cfg.setdefault("plugins", {})
         touched = {}
         for pid, key, ftype, getter in self._fields:
-            v = getter()
+            val = getter()
             if ftype == "int":
                 try:
-                    v = int(str(v).strip())
+                    val = int(str(val).strip())
                 except (ValueError, TypeError):
-                    v = 0
-            touched.setdefault(pid, {})[key] = v
+                    val = 0
+            touched.setdefault(pid, {})[key] = val
         for pid, vals in touched.items():
             m = dict(cfg["plugins"].get(pid, {}))
             m.update(vals)
@@ -184,13 +183,7 @@ class SettingsInterface(ScrollArea):
 class AboutInterface(ScrollArea):
     def __init__(self, win):
         super().__init__()
-        self.setObjectName("about")
-        w = QWidget()
-        self.setWidget(w)
-        self.setWidgetResizable(True)
-        v = QVBoxLayout(w)
-        v.setContentsMargins(36, 24, 36, 24)
-        v.setSpacing(10)
+        v = _themed_body(self, "about")
         v.addWidget(TitleLabel("LockDevice · 专注锁定"))
         v.addWidget(BodyLabel(f"版本 v{core.VERSION}"))
         v.addWidget(BodyLabel("界面正在从 tkinter 迁移到 PySide6 + qfluentwidgets。"))
@@ -212,8 +205,8 @@ class MainWindow(FluentWindow):
 
 
 def run():
-    setTheme(Theme.DARK)
     app = QApplication.instance() or QApplication(sys.argv)
+    setTheme(Theme.DARK)          # 必须在建窗口前设好主题，否则控件按浅色渲染
     w = MainWindow()
     w.show()
     app.exec()
