@@ -13,6 +13,7 @@ import time
 import subprocess
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout
+from PySide6.QtGui import QIcon
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
                             setTheme, Theme, TitleLabel, SubtitleLabel, BodyLabel,
                             PrimaryPushButton, PushButton, SpinBox, SwitchButton, ComboBox,
@@ -27,6 +28,15 @@ else:
     import lock_device as core      # 独立导入 gui 时
 
 _CREATE_NO_WINDOW = 0x08000000
+
+
+def _app_icon():
+    """本体的 .ico（任务栏/标题栏图标）；进程 AppUserModelID 已由 lock_device 设好。"""
+    try:
+        p = core._icon_path()
+        return QIcon(p) if p else QIcon()
+    except Exception:
+        return QIcon()
 
 
 def _spawn(*args):
@@ -363,6 +373,9 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LockDevice · 专注锁定")
+        ico = _app_icon()
+        if not ico.isNull():
+            self.setWindowIcon(ico)
         self.resize(920, 640)
         self.plugin_api = core._build_plugin_api(None)
         self.plugin_pages = {}
@@ -397,6 +410,9 @@ class MainWindow(FluentWindow):
 
 def run():
     app = QApplication.instance() or QApplication(sys.argv)
+    ico = _app_icon()
+    if not ico.isNull():
+        app.setWindowIcon(ico)
     setTheme(Theme.DARK)
     w = MainWindow()
     w.show()
