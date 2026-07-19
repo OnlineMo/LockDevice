@@ -140,12 +140,21 @@ _todo = [v for v in VARIANTS if not _only or v[0] in _only]
 def build_one(suffix, with_gui, with_plugins, desc):
     print(f"\n===== 构建 {suffix} · {desc} =====")
     a = [PY, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
-         "--name", NAME, "--version-file", VER_FILE, "--collect-all", "customtkinter"]
-    if with_gui:    # Qt 现代界面：打进 gui 模块 + Qt 库
-        a += ["--collect-all", "PySide6", "--collect-all", "qfluentwidgets",
-              "--hidden-import", "gui.app"]
-    else:           # 排除 Qt，体积更小；运行时 _qt_available()→False→自动用 tkinter
-        a += ["--exclude-module", "PySide6", "--exclude-module", "qfluentwidgets",
+         "--name", NAME, "--version-file", VER_FILE]
+    if with_gui:    # Qt 现代界面：只收 gui 模块 + qfluentwidgets 资源；PySide6 交给自动分析（不 collect-all）
+        a += ["--hidden-import", "gui.app", "--collect-all", "qfluentwidgets",
+              "--exclude-module", "customtkinter"]   # 不带 customtkinter（HAS_CTK→False，模式一锁屏用原生 tkinter）
+        # qfluentwidgets 是纯 QWidget 组件，排除这些重型 Qt 模块（仅 WebEngine 就上百 MB）→ 大幅瘦身
+        for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick", "QtWebChannel",
+                  "QtQml", "QtQuick", "QtQuick3D", "QtQuickWidgets", "QtQuickControls2",
+                  "Qt3DCore", "Qt3DRender", "Qt3DExtras", "QtCharts", "QtDataVisualization",
+                  "QtMultimedia", "QtMultimediaWidgets", "QtPdf", "QtPdfWidgets", "QtSensors",
+                  "QtSerialPort", "QtBluetooth", "QtPositioning", "QtLocation",
+                  "QtDesigner", "QtHelp", "QtTest"):
+            a += ["--exclude-module", "PySide6." + m]
+    else:           # tkinter：收 customtkinter，排除 Qt，体积最小
+        a += ["--collect-all", "customtkinter",
+              "--exclude-module", "PySide6", "--exclude-module", "qfluentwidgets",
               "--exclude-module", "shiboken6", "--exclude-module", "gui"]
     if with_plugins and os.path.isdir("plugins"):
         a += ["--add-data", "plugins" + os.pathsep + "plugins"]

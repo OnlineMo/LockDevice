@@ -2431,6 +2431,18 @@ def main():
         print("qt" if _qt_available() else "tk")
         return
 
+    if "--selftest" in argv:       # 诊断：离屏构造 Qt 主窗口，验证瘦身后 Qt 库/qfluentwidgets 资源齐全（无需显示器）
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+            from gui.app import MainWindow
+            _app = QApplication.instance() or QApplication([])
+            _w = MainWindow()
+            print("GUI_OK", _w.metaObject().className())
+        except Exception as _e:
+            print("GUI_FAIL:", repr(_e))
+        return
+
     # --open（提权打开）或无参数：显示启动器
     tidy_portable_leftovers()
     set_taskmgr_disabled(False)  # 未在锁定中：确保任务管理器可用（含崩溃恢复）
