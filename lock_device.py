@@ -1417,6 +1417,8 @@ class App:
                           COL_BLUE).pack(fill="x", pady=6)
         if any(getattr(mod, "SETTINGS", None) for _m, mod in plugins):
             self._btn(c, "⚙   设置", self.show_settings, COL_GRAY).pack(fill="x", pady=6)
+        if load_plugins():
+            self._btn(c, "🧩  插件管理（启用/关闭）", self.show_plugin_manage, COL_GRAY).pack(fill="x", pady=6)
         # 次要操作
         if installed:
             self._btn(c, "✖   卸载", self.on_uninstall, COL_RED).pack(fill="x", pady=6)
@@ -1530,6 +1532,55 @@ class App:
                 self._btn(box, act.get("label", act.get("fn", "")),
                           (lambda f=fn: f(self.plugin_api)), COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
         self._bring_to_front()
+
+    # ---------------- 插件管理（启用/关闭） ----------------
+    def show_plugin_manage(self):
+        self.root.deiconify()
+        c = self._clear()
+        ctk.CTkLabel(c, text="🧩  插件管理", font=(FONT, 20, "bold")).pack(pady=(4, 2))
+        ctk.CTkLabel(c, text="开关启用 / 关闭插件（关闭后不加载运行、开机也不唤醒）",
+                     text_color="gray", font=(FONT, 11)).pack(pady=(0, 8))
+        bottom = ctk.CTkFrame(c, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", pady=(6, 0))
+        ctk.CTkButton(bottom, text="←  返回", fg_color=COL_GRAY,
+                      command=self.show_launcher).pack(fill="x")
+        box = ctk.CTkScrollableFrame(c, fg_color="transparent")
+        box.pack(side="top", fill="both", expand=True)
+        allp = load_plugins()
+        if not allp:
+            ctk.CTkLabel(box, text="（plugins/ 下暂无插件）", text_color="gray").pack(pady=10)
+        dis = load_config().get("plugins_disabled", [])
+        for meta, mod in allp:
+            pid = meta["id"]
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.pack(fill="x", padx=6, pady=4)
+            var = tk.BooleanVar(value=(pid not in dis))
+            ctk.CTkLabel(row, text=f"{meta.get('name', pid)}  ·  v{meta.get('version', '')}",
+                         anchor="w", font=(FONT, 13)).pack(side="left", fill="x", expand=True)
+            ctk.CTkSwitch(row, text="", variable=var,
+                          command=lambda p=pid, m=mod, v=var: self._toggle_plugin(p, m, v.get())).pack(side="right")
+        self._bring_to_front()
+
+    def _toggle_plugin(self, pid, mod, on):
+        cfg = load_config()
+        dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
+        if on:
+            cfg["plugins_disabled"] = dis
+            save_config(cfg)
+            if hasattr(mod, "on_settings_saved"):
+                try:
+                    mod.on_settings_saved(self.plugin_api, dict(cfg.get("plugins", {}).get(pid, {})))
+                except Exception:
+                    _log("on_settings_saved 失败\n" + traceback.format_exc())
+        else:
+            dis.append(pid)
+            cfg["plugins_disabled"] = dis
+            save_config(cfg)
+            if hasattr(mod, "on_uninstall"):
+                try:
+                    mod.on_uninstall(self.plugin_api)
+                except Exception:
+                    _log("on_uninstall 失败\n" + traceback.format_exc())
 
     def on_install(self):
         self._install_dialog()
