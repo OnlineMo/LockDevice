@@ -147,10 +147,14 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.6.1"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.6.2"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.6.2": [
+        "修复「发现更新」窗在浅色系统下看不清：窗口强制了深色主题的文字色，却没有主题背景色（普通 QWidget 不像 FluentWindow 自带底色），浅色 Windows 上呈“浅底浅字”。现补上深色背景。",
+        "修复「更新到新版本」按钮点了没反应：Nuitka onefile 构建里 sys.executable 指向解压目录中并不存在的虚拟 python.exe，导致提权更新/安装流程静默失败。现统一改用真实入口 exe 路径（同时修复 安装/更新复制、界面自我拉起、exe 同目录插件热加载）。",
+    ],
     "1.6.1": [
         "修复 qt / qt-plugins 版启动崩溃：上一版 Qt 界面启动即退出（报“Nuitka: A segmentation fault”）。根因是构建工具 Nuitka 4.3 的缺陷（4.3.1 热修已解决）；本次起锁定 nuitka[onefile]>=4.3.1,<5 重新构建。",
         "修复「发现更新」窗不弹：新版单文件在已装机器上启动时，会先把自己的版本号写进 version.txt，导致随后判定「无更新」不弹窗；现改为只有从安装目录启动的进程才同步 version.txt。",
@@ -279,7 +283,20 @@ def _hide_console():
 
 
 def _self_path():
-    return sys.executable if IS_FROZEN else os.path.abspath(__file__)
+    """本程序真实入口 exe（冻结态）。Nuitka onefile 下 sys.executable 指向解压目录里的
+    虚拟 python.exe（磁盘上不存在）；引导层保留的原始入口路径在 sys.argv[0]（真实存在），
+    优先用它，其次才用 sys.executable（standalone / 安装目录 app\\ 副本等）。
+    relaunch_as_admin / _spawn / do_install / 任务动作都依赖本函数——指到幽灵路径会静默失败。"""
+    if not IS_FROZEN:
+        return os.path.abspath(__file__)
+    exe = sys.executable
+    if not os.path.exists(exe):
+        arg0 = sys.argv[0] if sys.argv else ""
+        if arg0:
+            arg0 = os.path.abspath(arg0)
+            if os.path.exists(arg0):
+                return arg0
+    return exe
 
 
 def _pythonw_path():
@@ -326,7 +343,7 @@ def is_admin():
 def relaunch_as_admin(extra_args=""):
     """以管理员身份重新启动本程序（弹一次 UAC）。成功返回 True。"""
     if IS_FROZEN:
-        exe, params = sys.executable, extra_args
+        exe, params = _self_path(), extra_args   # onefile 下 sys.executable 是幽灵路径（不存在）
     else:
         exe, params = _pythonw_path(), f'"{_self_path()}" {extra_args}'.strip()
     try:
@@ -751,7 +768,7 @@ def _plugins_dirs():
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             dirs.append(os.path.join(meipass, "plugins"))                       # 打包内置
-        dirs.append(os.path.join(os.path.dirname(sys.executable), "plugins"))   # exe 同级：热添加
+        dirs.append(os.path.join(os.path.dirname(_self_path()), "plugins"))     # exe 同级：热添加
     else:
         dirs.append(os.path.join(os.path.dirname(_self_path()), "plugins"))
     seen, out = set(), []
