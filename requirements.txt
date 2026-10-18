@@ -2,7 +2,10 @@
 # 经典 tkinter 界面（tk 变体 / 回退用）
 customtkinter
 # 现代 Qt 界面（本体检测到就用它；构建 qt 变体需要）
-PySide6
+# ⚠ 固定 <6.12：PySide6 6.12.0 有兼容回归——qfluentwidgets 的 SpinBox / DoubleSpinBox /
+#    CompactSpinBox 内部编辑区被压成 1px，数值全部显示不出来（6.11.2 正常；原生 QSpinBox 不受影响）。
+#    等上游修复后再放开这个上限。
+PySide6<6.12
 PySide6-Fluent-Widgets
 # 打包（Nuitka 编译为单文件 exe；[onefile] 额外带 zstandard，用于压缩 onefile 载荷）
 # 首次构建自动下载 MinGW64（本机无 MSVC 时），无需手工装工具链
