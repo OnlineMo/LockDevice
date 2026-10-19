@@ -188,6 +188,13 @@ def build_one(suffix, with_gui, with_plugins, desc):
         # 用绝对路径 + *.py 通配，避免把 __pycache__ 等带进去。
         _plug_pat = os.path.join(os.path.abspath("plugins"), "*.py")
         a += ["--include-data-files=" + _plug_pat + "=plugins/"]
+        # 文件夹插件（plugins/<目录>/plugin.py + 图标等资源）：逐目录原样带
+        for _name in sorted(os.listdir("plugins")):
+            _p = os.path.join("plugins", _name)
+            if (_name.startswith(("_", ".")) or _name == "__pycache__"
+                    or not os.path.isdir(_p) or not os.path.isfile(os.path.join(_p, "plugin.py"))):
+                continue
+            a += ["--include-data-dir=" + os.path.abspath(_p) + "=plugins/" + _name]
     if os.path.exists(ICON):
         a += ["--windows-icon-from-ico=" + ICON,
               "--include-data-files=" + f"{ICON}={ICON}"]

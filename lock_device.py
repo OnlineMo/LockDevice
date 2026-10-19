@@ -27,11 +27,13 @@ import time
 import queue
 import shutil
 import getpass
+import inspect
 import threading
 import subprocess
 import traceback
 import importlib.util
 import types
+from collections import defaultdict
 try:
     import tkinter as tk
     from tkinter import messagebox
@@ -824,8 +826,9 @@ def _qt_available():
 
 
 def load_plugins(force=False):
-    """加载 plugins/*.py → [(meta, module), ...]。扫描内置 + exe 同级 plugins/（热添加），
-    外置同 id 覆盖内置。逐个隔离，坏插件只记日志、不影响其它。"""
+    """加载 plugins/*.py（单文件）与 plugins/<目录>/plugin.py（文件夹插件，可带资源文件）
+    → [(meta, module), ...]。扫描内置 + exe 同级 plugins/（热添加），外置同 id 覆盖内置。
+    逐个隔离，坏插件只记日志、不影响其它。"""
     global _PLUGINS_CACHE
     if _PLUGINS_CACHE is not None and not force:
         return _PLUGINS_CACHE
@@ -834,11 +837,21 @@ def load_plugins(force=False):
         if not (d and os.path.isdir(d)):
             continue
         for fn in sorted(os.listdir(d)):
-            if not fn.endswith(".py") or fn.startswith("_"):
+            if fn.startswith(("_", ".")) or fn == "__pycache__":
                 continue
+            # 单文件插件 plugins/*.py；文件夹插件 plugins/<目录>/plugin.py（可带资源，如 icon.png）
+            name = os.path.splitext(fn)[0]
+            if fn.endswith(".py"):
+                path = os.path.join(d, fn)
+            else:
+                cand = os.path.join(d, fn, "plugin.py")
+                if not (os.path.isdir(os.path.join(d, fn)) and os.path.isfile(cand)):
+                    continue
+                path = cand
+                name = fn + "_plugin"
             try:
                 spec = importlib.util.spec_from_file_location(
-                    "ld_plugin_" + os.path.splitext(fn)[0], os.path.join(d, fn))
+                    "ld_plugin_" + name, path)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
                 meta = getattr(mod, "PLUGIN", None)
@@ -850,7 +863,7 @@ def load_plugins(force=False):
                         by_id[pid] = len(out)
                         out.append((meta, mod))
             except Exception:
-                _log("插件加载失败 " + fn + "\n" + traceback.format_exc())
+                _log("插件加载失败 " + os.path.basename(path) + "\n" + traceback.format_exc())
     _PLUGINS_CACHE = out
     return out
 
@@ -871,6 +884,83 @@ def active_plugins():
     管理页要列全部请用 load_plugins()。"""
     dis = load_config().get("plugins_disabled", [])
     return [(m, mod) for m, mod in load_plugins() if m.get("id") not in dis]
+
+
+# ---------------- 插件图标（PLUGIN["icon"]，可选） ----------------
+def plugin_icon_source(meta, mod=None):
+    """解析插件图标声明 → (kind, value)。
+
+    kind ∈ "emoji" / "base64" / "file" / "fluent" / None（未声明或无效）：
+      "icon": "⏰"                           emoji 字符串（Qt/tk 双端一致）
+      "icon": {"base64": "<b64 PNG/GIF>"}    内嵌图片（双端一致；也接受 dataURL 前缀）
+      "icon": {"file": "icon.png"}          图片文件（相对插件文件所在目录；文件夹插件放资源用）
+      "icon": {"fluent": "Camera"}          FluentIcon 名（Qt 原生风格；tk 端回退为无图标）
+    任意形态失败都不影响插件加载——图标只是显示层。"""
+    raw = None
+    if isinstance(meta, dict):
+        raw = meta.get("icon")
+    if raw is None and mod is not None:
+        p = getattr(mod, "PLUGIN", None)
+        if isinstance(p, dict):
+            raw = p.get("icon")
+    if isinstance(raw, str) and raw.strip():
+        return "emoji", raw.strip()
+    if isinstance(raw, dict):
+        b64 = raw.get("base64")
+        if isinstance(b64, str) and b64.strip():
+            s = b64.strip()
+            if s.startswith("data:") and "," in s:
+                s = s.split(",", 1)[1]
+            return "base64", "".join(s.split())
+        fp = raw.get("file")
+        if isinstance(fp, str) and fp.strip():
+            base = os.path.dirname(getattr(mod, "__file__", "") or "") if mod is not None else ""
+            if base:
+                path = fp.strip() if os.path.isabs(fp.strip()) else os.path.join(base, fp.strip())
+                if os.path.isfile(path):
+                    return "file", path
+                _log("插件图标文件不存在：" + path)
+            return None, None
+        fn = raw.get("fluent")
+        if isinstance(fn, str) and fn.strip():
+            return "fluent", fn.strip()
+    return None, None
+
+
+def plugin_display_name(meta, mod=None, base=None):
+    """显示名（供文字场景）：emoji 图标自动加前缀（已有则不重复加）；其余原样。"""
+    name = str(base or (meta or {}).get("name") or (meta or {}).get("id") or "")
+    kind, val = plugin_icon_source(meta, mod)
+    if kind == "emoji" and val and not name.lstrip().startswith(val):
+        return f"{val} {name}"
+    return name
+
+
+_PLUGIN_PHOTO_CACHE = {}
+
+
+def _tk_plugin_photo(meta, mod=None, size=28):
+    """插件图标 → tk.PhotoImage | None（仅 base64 / file 图片形态；emoji / fluent 由文字表达）。
+    tk 原生支持 PNG/GIF；加载失败只记日志、返回 None（插件照常显示，不影响加载）。"""
+    if tk is None:
+        return None
+    kind, val = plugin_icon_source(meta, mod)
+    if kind not in ("base64", "file"):
+        return None
+    key = (kind, val, size)
+    if key in _PLUGIN_PHOTO_CACHE:
+        return _PLUGIN_PHOTO_CACHE[key]
+    ph = None
+    try:
+        ph = tk.PhotoImage(data=val) if kind == "base64" else tk.PhotoImage(file=val)
+        factor = max(1, int(max(ph.width(), ph.height()) / float(size)))
+        if factor > 1:
+            ph = ph.subsample(factor, factor)
+    except Exception:
+        _log("插件图标加载失败（tk 端需 PNG/GIF）：\n" + traceback.format_exc())
+        ph = None
+    _PLUGIN_PHOTO_CACHE[key] = ph
+    return ph
 
 
 _PLUGIN_LOCKS = {}
@@ -928,6 +1018,55 @@ def wait_plugin_ops(timeout=30):
             _log("退出前等待插件操作超时，仍有 %d 个在跑（下次登录 on_boot 会自愈）" % len(alive))
             return False
         alive[0].join(min(0.3, remain))
+
+
+def _call_plugin_action(fn, api, values=None):
+    """调插件动作函数（签名探测）：支持 `fn(api, values)`（收当前表单值）与 `fn(api)`。"""
+    try:
+        n = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        n = 1
+    if n >= 2:
+        fn(api, values if values is not None else {})
+    else:
+        fn(api)
+
+
+def _plugin_items_cb(mod, api, fn_name, index=None):
+    """items 控件回调路由（本体只回调、增删改归插件）：
+    点击/删除 → mod.fn(api, index)；底部添加 → mod.fn(api)。"""
+    fn = getattr(mod, fn_name or "", None)
+    if not callable(fn):
+        return
+    if index is None:
+        fn(api)
+    else:
+        fn(api, index)
+
+
+def _fmt_item(tpl, item):
+    """items 每项显示模板（如 "{name} · {time}"）：占位符取 item 的字段，缺省为空串。"""
+    try:
+        return str(tpl).format_map(defaultdict(str, {
+            str(k): ("" if v is None else v) for k, v in dict(item).items()}))
+    except Exception:
+        try:
+            return str(dict(item).get("name") or item)
+        except Exception:
+            return str(item)
+
+
+def _split_hhmm(s, default="00:00"):
+    """解析 "HH:MM" → (hh, mm)（两位字符串）；无效则回退 default；再不行回 "00","00"。"""
+    for src in (s, default):
+        try:
+            hh, mm = str(src).strip().split(":")
+            h, m = int(hh), int(mm)
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return f"{h:02d}", f"{m:02d}"
+        except (ValueError, AttributeError):
+            continue
+    return "00", "00"
 
 
 def _sync_plugin_autostart():
@@ -1014,13 +1153,24 @@ def _build_plugin_api(app=None):
         例：cmd, args = api.action_for("--plugin my_id tick")。"""
         return _action_for(extra_args)
 
+    def refresh():
+        """重渲染「当前显示的插件页」，把最新配置立刻显示出来（界面上下文专用；
+        无界面上下文（CLI 回调等）为空操作）。"""
+        _log("[plugin] api.refresh：当前无界面上下文，忽略")
+
+    def prompt(title="输入", fields=None):
+        """弹通用表单收集输入 → dict（键 = 字段 key）；用户取消 / 无界面上下文 → None。
+        字段定义与 SETTINGS 同款（bool/choice/int/str/time）。"""
+        _log(f"[plugin] api.prompt：无界面上下文，忽略（{title}）")
+        return None
+
     # 本体对插件只提供三类核心能力：**锁机**(start_lock) + **唤醒插件**(set_autostart → 登录回调 on_boot)
     # + **提权**(is_admin / run_admin，让插件继承本体管理员权限)；外加配置存取 / 对话框 / 环境信息 等支持。
     # 功能逻辑（何时锁、锁多久…）全在插件自己。界面由本体按 SETTINGS/ACTIONS 渲染（换 Qt 插件零改动）。
     return types.SimpleNamespace(
         get_settings=get_settings, save_settings=save_settings, set_autostart=set_autostart,
         start_lock=start_lock, is_admin=is_admin, run_admin=run_admin, is_installed=is_installed,
-        self_path=self_path, action_for=action_for,
+        self_path=self_path, action_for=action_for, prompt=prompt, refresh=refresh,
         DRY_RUN=DRY_RUN, VERSION=VERSION, log=_log,
         info=info, confirm=confirm, error=error)
 
@@ -1688,11 +1838,11 @@ class App:
         self._closing = False
         self._uiq = queue.Queue()
         self.root.after(50, self._drain_uiq)
-        self._wrap_plugin_api_dialogs()
+        self._wrap_plugin_api_ui()
 
     # ---------------- 插件回调的线程调度（工作线程 → Tk 主线程） ----------------
-    def _wrap_plugin_api_dialogs(self):
-        """把插件 api 的对话框包成线程安全：工作线程里调用时调度回主线程执行。"""
+    def _wrap_plugin_api_ui(self):
+        """把插件 api 的界面能力包成线程安全：工作线程里调用时调度回主线程执行。"""
         def ui_info(msg, title="LockDevice"):
             if DRY_RUN:
                 _log(f"[plugin] {msg}")
@@ -1710,9 +1860,73 @@ class App:
                 return True
             return bool(self._ui(lambda: messagebox.askyesno(title, msg), wait=True))
 
+        def ui_refresh():
+            """重渲染当前插件页（把最新配置显示出来）。"""
+            self._ui(self.refresh_current_plugin)
+
+        def ui_prompt(title="输入", fields=None):
+            """通用表单收集输入 → dict | None。"""
+            return self._ui(lambda: self.prompt_dialog(title, fields or []), wait=True)
+
         self.plugin_api.info = ui_info
         self.plugin_api.error = ui_error
         self.plugin_api.confirm = ui_confirm
+        self.plugin_api.refresh = ui_refresh
+        self.plugin_api.prompt = ui_prompt
+
+    def refresh_current_plugin(self):
+        """重渲染当前显示的插件页（插件 api.refresh() 的实现路径）。仅主线程调用。"""
+        cur = getattr(self, "_current_plugin", None)
+        if cur:
+            meta, mod = cur
+            self._show_plugin(meta, mod)
+
+    def prompt_dialog(self, title, fields):
+        """本体渲染的通用输入弹窗（插件 api.prompt 的实现）。仅主线程调用。
+        字段定义与 SETTINGS 同款（bool/choice/int/str/time；status/items 不适用于弹窗）。
+        用户点「确定」返回 {key: value}；取消返回 None。"""
+        res = {}
+        top = ctk.CTkToplevel(self.root)
+        top.title(title)
+        _set_icon(top)
+        top.transient(self.root)
+        ctk.CTkLabel(top, text=title, font=(FONT, 16, "bold")).pack(pady=(14, 8))
+        box = ctk.CTkFrame(top, fg_color="transparent")
+        box.pack(fill="both", expand=True, padx=14)
+        store = []
+        for f in fields:
+            if f.get("type") in ("status", "items"):
+                continue        # 页面专属控件，弹窗里不适用
+            self._render_setting_field(box, "_prompt", f, {}, store=store)
+        btns = ctk.CTkFrame(top, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=14)
+
+        def ok():
+            touched = {}
+            for _p, key, ftype, getter in store:
+                try:
+                    v = getter()
+                except Exception:
+                    continue
+                if ftype == "int":
+                    try:
+                        v = int(str(v).strip())
+                    except (ValueError, TypeError):
+                        v = 0
+                touched[key] = v
+            res["v"] = touched
+            top.destroy()
+
+        self._btn(btns, "确定", ok, COL_GREEN).pack(side="left", expand=True, fill="x", padx=(0, 6))
+        ctk.CTkButton(btns, text="取消", fg_color=COL_GRAY,
+                      command=top.destroy).pack(side="left", expand=True, fill="x")
+        top.minsize(400, 180)
+        try:
+            top.grab_set()      # 模态；个别环境（隐藏窗口等）可能不支持，忽略
+        except Exception:
+            pass
+        self.root.wait_window(top)
+        return res.get("v")
 
     def _drain_uiq(self):
         """主线程轮询：执行工作线程排入的 UI 回调。"""
@@ -1823,6 +2037,7 @@ class App:
 
     # ---- 通用组件 ----
     def _clear(self):
+        self._current_plugin = None   # 切换视图：不再指向任何插件页（供 api.refresh 判断）
         if self.content is not None:
             self.content.destroy()
         if HAS_CTK:
@@ -1832,8 +2047,10 @@ class App:
         self.content.pack(fill="both", expand=True, padx=22, pady=16)
         return self.content
 
-    def _btn(self, parent, text, cmd, color=None, height=44):
+    def _btn(self, parent, text, cmd, color=None, height=44, image=None):
         kw = {"fg_color": color} if color else {}
+        if image is not None:
+            kw["image"] = image          # tk.PhotoImage（插件图片图标；PNG/GIF）
         return ctk.CTkButton(parent, text=text, command=cmd, height=height,
                              font=(FONT, 14, "bold"), corner_radius=10, **kw)
 
@@ -1872,8 +2089,11 @@ class App:
         for meta, mod in plugins:
             if getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None):
                 label = meta.get("button") or meta.get("name") or meta.get("id")
+                photo = _tk_plugin_photo(meta, mod)      # 图片图标（base64/file）；无则用 emoji 前缀
+                if photo is None:
+                    label = plugin_display_name(meta, mod, base=label)
                 self._btn(c, label, (lambda mt=meta, md=mod: self._show_plugin(mt, md)),
-                          COL_BLUE).pack(fill="x", pady=6)
+                          COL_BLUE, image=photo).pack(fill="x", pady=6)
         if any(getattr(mod, "SETTINGS", None) for _m, mod in plugins):
             self._btn(c, "⚙   设置", self.show_settings, COL_GRAY).pack(fill="x", pady=6)
         if load_plugins():
@@ -1902,39 +2122,147 @@ class App:
                       command=self.show_launcher).pack(fill="x")
         box = ctk.CTkScrollableFrame(c, fg_color="transparent")
         box.pack(side="top", fill="both", expand=True)
-        self._settings_vars = []   # [(pid, key, type, tk_var)]
+        self._settings_vars = []   # [(pid, key, type, getter)]（getter 为无参可调用）
         plugins = [(m, mod) for m, mod in active_plugins() if getattr(mod, "SETTINGS", None)]
         if not plugins:
             ctk.CTkLabel(box, text="（暂无可配置的插件）", text_color="gray").pack(pady=10)
         self._render_plugin_settings(box, plugins)
         self._bring_to_front()
 
-    def _render_setting_field(self, box, pid, field, vals):
-        key, ftype = field["key"], field.get("type", "str")
+    def _render_setting_field(self, box, pid, field, vals, store=None, mod=None):
+        """按声明渲染一个设置控件。store（默认 self._settings_vars）追加
+        (pid, key, type, getter)；status / items 是展示型控件、不入 store。
+        字段类型：bool / choice / int / str（原有）+ time / status / items（新增）；
+        int 带 min/max/step 时渲染为 Spinbox；status / items 需要 mod（弹窗里自动跳过）。"""
+        store = self._settings_vars if store is None else store
+        ftype = field.get("type", "str")
+        key = field.get("key", "")
         cur = vals.get(key, field.get("default"))
+
+        if ftype == "status":       # 展示型：渲染时调插件函数取动态文本
+            if mod is None:
+                return
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=3)
+            fn = getattr(mod, field.get("fn", ""), None)
+            text = "（未声明 fn）"
+            if callable(fn):
+                try:
+                    text = str(fn(self.plugin_api))
+                except Exception:
+                    _log("status 字段读取失败\n" + traceback.format_exc())
+                    text = "（读取失败，详见 error.log）"
+            ctk.CTkLabel(row, text=field.get("label", "状态"), font=(FONT, 12)).pack(side="left")
+            ctk.CTkLabel(row, text=text, font=(FONT, 12), text_color="gray",
+                         wraplength=250, justify="right").pack(side="right")
+            return
+
+        if ftype == "items":        # 展示型：条目列表（可点/可删/可加，全部回调插件）
+            if mod is None:
+                return
+            self._render_items_field(box, pid, field, vals, mod)
+            return
+
         row = ctk.CTkFrame(box, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=3)
         if ftype == "bool":
             var = tk.BooleanVar(value=bool(cur))
             ctk.CTkCheckBox(row, text=field.get("label", key), variable=var,
                             font=(FONT, 12)).pack(anchor="w")
+            store.append((pid, key, ftype, lambda v=var: v.get()))
         elif ftype == "choice":
             opts = [str(o) for o in field.get("options", [])]
             var = tk.StringVar(value=str(cur if cur is not None else (opts[0] if opts else "")))
             ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
             ctk.CTkOptionMenu(row, variable=var, values=opts, width=150).pack(side="right")
-        else:   # int / str
+            store.append((pid, key, ftype, lambda v=var: v.get()))
+        elif ftype == "time":       # HH:MM 时间点：时/分两个下拉（存 "HH:MM" 字符串）
+            hh, mm = _split_hhmm(cur if cur is not None else field.get("default"))
+            ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
+            wrap = ctk.CTkFrame(row, fg_color="transparent")
+            wrap.pack(side="right")
+            h_var = tk.StringVar(value=hh)
+            m_var = tk.StringVar(value=mm)
+            ctk.CTkOptionMenu(wrap, variable=h_var, width=72,
+                              values=[f"{h:02d}" for h in range(24)]).pack(side="left")
+            ctk.CTkLabel(wrap, text=":").pack(side="left", padx=2)
+            ctk.CTkOptionMenu(wrap, variable=m_var, width=72,
+                              values=[f"{m:02d}" for m in range(60)]).pack(side="left")
+            store.append((pid, key, ftype, lambda h=h_var, m=m_var: f"{h.get()}:{m.get()}"))
+        elif ftype == "int" and any(k in field for k in ("min", "max", "step")):
+            lo, hi = int(field.get("min", 0)), int(field.get("max", 999999))
+            try:
+                val = int(cur)
+            except (ValueError, TypeError):
+                val = lo
+            ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
+            spin = tk.Spinbox(row, from_=lo, to=hi, increment=int(field.get("step", 1)),
+                              width=140, justify="center", font=(FONT, 12),
+                              bg="#2b2b2b", fg="#f0f0f0", buttonbackground="#3a3a3a",
+                              relief="flat", highlightthickness=0)
+            spin.delete(0, "end")
+            spin.insert(0, str(val))
+            spin.pack(side="right")
+            store.append((pid, key, "int", lambda s=spin: s.get()))
+        else:   # int（无范围）/ str：纯文本框
             var = tk.StringVar(value="" if cur is None else str(cur))
             ctk.CTkLabel(row, text=field.get("label", key), font=(FONT, 12)).pack(side="left")
             ctk.CTkEntry(row, textvariable=var, width=150, justify="center").pack(side="right")
-        self._settings_vars.append((pid, key, ftype, var))
+            store.append((pid, key, ftype, lambda v=var: v.get()))
 
-    def _save_settings(self):
-        cfg = load_config()
-        cfg.setdefault("plugins", {})
-        touched = {}
-        for pid, key, ftype, var in getattr(self, "_settings_vars", []):
-            v = var.get()
+    def _render_items_field(self, box, pid, field, vals, mod):
+        """items 字段：条目列表（display 模板）+ 每项「删除」+ 底部「添加」；
+        点击/删除 → mod.<fn>(api, index)，添加 → mod.<fn>(api)。本体只回调——
+        插件应在回调里用 api.prompt 收集输入、api.save_settings 写回、api.refresh 刷新列表。"""
+        items = vals.get(field.get("key"), field.get("default") or [])
+        if not isinstance(items, list):
+            items = []
+        tpl = field.get("display") or "{name}"
+        click_fn, remove_fn, add_fn = field.get("click"), field.get("remove"), field.get("add")
+        if not (click_fn or remove_fn or add_fn):
+            return
+        wrap = ctk.CTkFrame(box, fg_color="transparent")
+        wrap.pack(fill="x", padx=8, pady=(6, 3))
+        ctk.CTkLabel(wrap, text=field.get("label", "条目"), font=(FONT, 12),
+                     text_color="gray", anchor="w").pack(fill="x")
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            r = ctk.CTkFrame(wrap, fg_color="transparent")
+            r.pack(fill="x", pady=2)
+            cmd = (lambda p=pid, m=mod, f=click_fn, x=i: self._dispatch_items(p, m, f, x)) \
+                if click_fn else None
+            self._btn(r, _fmt_item(tpl, item), cmd, COL_BLUE, height=36).pack(
+                side="left", fill="x", expand=True)
+            if remove_fn:
+                ctk.CTkButton(r, text="删除", fg_color=COL_GRAY, width=64, height=36,
+                              font=(FONT, 12),
+                              command=lambda p=pid, m=mod, f=remove_fn, x=i:
+                              self._dispatch_items(p, m, f, x)).pack(side="left", padx=(6, 0))
+        if add_fn:
+            self._btn(wrap, field.get("add_label", "＋ 添加"),
+                      lambda p=pid, m=mod, f=add_fn: self._dispatch_items(p, m, f),
+                      COL_GREEN, height=36).pack(fill="x", pady=(4, 0))
+
+    def _dispatch_items(self, pid, mod, fn_name, index=None):
+        """items 回调：工作线程执行（插件通常在其中弹 prompt + 保存 + 刷新），
+        与开关/保存/动作共用 plugin_op_lock 串行。"""
+        def work():
+            try:
+                with plugin_op_lock(pid):
+                    _plugin_items_cb(mod, self.plugin_api, fn_name, index)
+            except Exception:
+                _log("plugin items 回调失败\n" + traceback.format_exc())
+        run_plugin_op(work)
+
+    def _collect_settings(self):
+        """读取当前表单（含未保存改动）→ {pid: {key: value}}。仅主线程调用（读 Tk 变量）。"""
+        out = {}
+        for pid, key, ftype, getter in getattr(self, "_settings_vars", []):
+            try:
+                v = getter()
+            except Exception:
+                continue
             if ftype == "bool":
                 v = bool(v)
             elif ftype == "int":
@@ -1942,7 +2270,13 @@ class App:
                     v = int(str(v).strip())
                 except (ValueError, TypeError):
                     v = 0
-            touched.setdefault(pid, {})[key] = v
+            out.setdefault(pid, {})[key] = v
+        return out
+
+    def _save_settings(self):
+        cfg = load_config()
+        cfg.setdefault("plugins", {})
+        touched = self._collect_settings()
         for pid, values in touched.items():
             merged = dict(cfg["plugins"].get(pid, {}))
             merged.update(values)
@@ -1975,13 +2309,13 @@ class App:
             ctk.CTkLabel(box, text=meta.get("name", pid), font=(FONT, 14, "bold"),
                          anchor="w").pack(fill="x", padx=4, pady=(10, 2))
             for field in getattr(mod, "SETTINGS", []):
-                self._render_setting_field(box, pid, field, vals)
+                self._render_setting_field(box, pid, field, vals, mod=mod)
 
     def _show_plugin(self, meta, mod):
         """插件单页（单窗切换）：本体按插件声明的 SETTINGS + ACTIONS 渲染；插件只写后端。"""
         self.root.deiconify()
         c = self._clear()
-        ctk.CTkLabel(c, text=meta.get("name", meta["id"]), font=(FONT, 22, "bold")).pack(pady=(4, 2))
+        ctk.CTkLabel(c, text=plugin_display_name(meta, mod), font=(FONT, 22, "bold")).pack(pady=(4, 2))
         ctk.CTkLabel(c, text=f"v{meta.get('version', '')}", text_color="gray",
                      font=(FONT, 11)).pack(pady=(0, 8))
         bottom = ctk.CTkFrame(c, fg_color="transparent")
@@ -1998,17 +2332,26 @@ class App:
             fn = getattr(mod, act.get("fn", ""), None)
             if callable(fn):
                 self._btn(box, act.get("label", act.get("fn", "")),
-                          (lambda f=fn, p=meta["id"]: self._run_plugin_action(p, f)),
+                          (lambda f=fn, p=meta["id"], m=mod: self._run_plugin_action(p, m, f)),
                           COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
+        # 记录「当前显示的插件页」，供插件 api.refresh() 重渲染用
+        self._current_plugin = (meta, mod)
         self._bring_to_front()
 
-    def _run_plugin_action(self, pid, fn):
-        """插件动作按钮：工作线程执行（可能含 schtasks 等慢操作），对话框自动调度回主线程；
-        与开关/保存共用 plugin_op_lock，同一插件不会并发跑多个操作。"""
+    def _run_plugin_action(self, pid, mod, fn):
+        """插件动作按钮：主线程取当前表单值（含未保存改动）→ 工作线程执行
+        （可能含 schtasks 等慢操作，对话框自动调度回主线程）；
+        与开关/保存/items 共用 plugin_op_lock，同一插件不会并发跑多个操作。
+        动作函数签名：`fn(api, values)` 或 `fn(api)` 均可（签名探测）。"""
+        try:
+            values = self._collect_settings().get(pid, {})
+        except Exception:
+            values = {}
+
         def work():
             try:
                 with plugin_op_lock(pid):
-                    fn(self.plugin_api)
+                    _call_plugin_action(fn, self.plugin_api, values)
             except Exception:
                 _log("plugin action 失败\n" + traceback.format_exc())
         run_plugin_op(work)
@@ -2035,7 +2378,10 @@ class App:
             row = ctk.CTkFrame(box, fg_color="transparent")
             row.pack(fill="x", padx=6, pady=4)
             var = tk.BooleanVar(value=(pid not in dis))
-            ctk.CTkLabel(row, text=f"{meta.get('name', pid)}  ·  v{meta.get('version', '')}",
+            photo = _tk_plugin_photo(meta, mod)
+            if photo is not None:
+                ctk.CTkLabel(row, text="", image=photo).pack(side="left", padx=(0, 6))
+            ctk.CTkLabel(row, text=f"{plugin_display_name(meta, mod)}  ·  v{meta.get('version', '')}",
                          anchor="w", font=(FONT, 13)).pack(side="left", fill="x", expand=True)
             sw = ctk.CTkSwitch(row, text="", variable=var)
             sw.configure(command=lambda p=pid, m=mod, v=var, s=sw: self._toggle_plugin(p, m, v.get(), s))

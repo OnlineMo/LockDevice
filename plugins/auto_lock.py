@@ -18,13 +18,16 @@ PLUGIN = {
     "name": "自动锁机",
     "version": "1.0.1",
     "button": "⏰  自动锁机",
+    "icon": "⏰",          # 插件图标：emoji（Qt 侧栏 / 管理页，tk 文字前缀）；亦支持 {"base64"}/{"file"}/{"fluent"}
     "autostart": True,   # 需要：每次登录检查时间窗口、锁剩余时间
 }
 
 SETTINGS = [
     {"key": "enabled", "label": "启用每日自动锁机", "type": "bool", "default": False},
-    {"key": "time",    "label": "每天开始时间 (HH:MM)", "type": "str", "default": "22:00"},
-    {"key": "minutes", "label": "锁机时长（分钟）", "type": "int", "default": 30},
+    # 时间点用 time 类型（本体渲染时间选择器，不用手输）；存 "HH:MM" 字符串，与旧值兼容
+    {"key": "time",    "label": "每天开始时间", "type": "time", "default": "22:00"},
+    {"key": "minutes", "label": "锁机时长（分钟）", "type": "int", "default": 30,
+     "min": 1, "max": 24 * 60, "step": 5},
 ]
 
 ACTIONS = [

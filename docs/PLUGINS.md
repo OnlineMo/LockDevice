@@ -20,7 +20,11 @@
 
 ## 二、放哪
 
-`plugins/<你的插件 id>.py`。以下划线 `_` 开头的文件会被忽略。
+两种格式（可混用；`_` / `.` 开头的文件与目录会被忽略）：
+
+1. **单文件插件**：`plugins/<你的插件 id>.py`——一个 .py 走天下（推荐；图标可用 emoji / base64 内嵌图片）。
+2. **文件夹插件**：`plugins/<目录>/plugin.py`（可附带资源文件，如 `icon.png`）——适合需要图片资源的插件；
+   打包（`python build.py`）会整目录带上，热添加（exe 同级 `plugins/`）同样识别。
 
 调试是否被识别：`python lock_device.py --list-plugins`（打包后 `LockDevice.exe --list-plugins` 同样可用，用来验证冻结态加载）。
 
@@ -33,30 +37,59 @@ PLUGIN = {
     "name": "自动锁机",        # 显示名
     "version": "1.0.0",
     "button": "⏰  自动锁机",   # 主页按钮文字（缺省用 name）
+    "icon": "⏰",              # 插件图标（可选），见下
     "autostart": False,       # 是否需要「本体开机自启」，见第六节
 }
 ```
+
+**`icon`（可选）——插件图标**，四种形态（失败不影响加载，只是显示层）：
+
+| 形态 | 写法 | 效果 |
+|---|---|---|
+| emoji | `"icon": "⏰"` | Qt 侧栏/管理页画成图标；tk 端作文字前缀 —— **双端一致，推荐** |
+| 内嵌图片 | `"icon": {"base64": "<PNG/GIF 的 base64>"}` | 单文件插件零依赖带图（**双端一致**；也接受 `data:image/png;base64,` 前缀） |
+| 图片文件 | `"icon": {"file": "icon.png"}` | 相对**插件文件所在目录**（配合文件夹插件放资源） |
+| FluentIcon | `"icon": {"fluent": "Camera"}` | Qt 原生风格（名字不区分大小写，如 `Camera` / `CAMERA`）；tk 端回退为无图标 |
+
+> 图片建议方形、≥28px；tk 端走 Tk 原生图片（仅 **PNG/GIF**），想全格式统一建议用 PNG。
 
 ### 2. `SETTINGS`（可选，list）——前端声明，本体渲染成统一表单
 ```python
 SETTINGS = [
     {"key": "enabled", "label": "启用",         "type": "bool",   "default": False},
-    {"key": "time",    "label": "时间 (HH:MM)", "type": "str",    "default": "22:00"},
-    {"key": "minutes", "label": "时长（分钟）",  "type": "int",    "default": 30},
+    {"key": "time",    "label": "开始时间",      "type": "time",   "default": "22:00"},
+    {"key": "minutes", "label": "时长（分钟）",   "type": "int",    "default": 30,
+     "min": 1, "max": 1440, "step": 5},
     {"key": "mode",    "label": "方式",         "type": "choice", "default": "锁屏",
      "options": ["锁屏", "关机"]},
+    {"key": "note",    "label": "备注",         "type": "str",    "default": ""},
+    {"label": "状态",  "type": "status", "fn": "get_status"},
+    {"key": "items",   "label": "条目", "type": "items", "default": [],
+     "display": "{name} · {time}", "click": "run_item", "add": "add_item", "remove": "remove_item"},
 ]
 ```
-- `type` ∈ `bool` / `int` / `str` / `choice`（`choice` 需 `options`）。
+
+| `type` | 渲染（Qt / tk） | 存储 |
+|---|---|---|
+| `bool` | 开关 | bool |
+| `int` / `str` | 文本输入框 | int / str |
+| `int` + `min`/`max`/`step` | **数字框**（SpinBox） | int |
+| `choice` | 下拉框（需 `options`） | str |
+| `time` | **时间选择器**（TimeEdit / 时+分下拉；存 `"HH:MM"` 字符串） | str |
+| `status` | 只读动态文本：渲染时调 `fn(api)` 显示返回字符串（需 `fn`，可无 `key`） | 不存储 |
+| `items` | **条目列表**：每项按 `display` 模板显示；`click`/`remove` 回调 `fn(api, index)`、`add` 回调 `fn(api)`（均可选） | `list[dict]` |
+
 - 值存在**与本体共用**的 `config.json` 里的 `cfg["plugins"][<id>][<key>]`，按插件分区。
+- `items` 的增删改**全归插件**：回调里用 `api.prompt()` 收集输入、`api.save_settings()` 写回、**`api.refresh()` 让列表立刻刷新**（本体只回调，不替你改数据）。
 - 主页会给有 `SETTINGS`/`ACTIONS` 的插件放一个按钮（进入该插件单页）；另有统一「⚙ 设置」页聚合所有插件的 `SETTINGS`。
+- `api.prompt()` 弹窗支持同样的字段定义（`status` / `items` 除外）。
 
 ### 3. `ACTIONS`（可选，list）——声明按钮，本体渲染，点击调同名后端函数
 ```python
 ACTIONS = [{"label": "🔒  立即锁一次", "fn": "lock_now"}]
 
-def lock_now(api):
-    ...
+def lock_now(api, values):      # 可选收「当前表单值」（含未保存的改动）
+    ...                          # 只要 fn(api) 也可以（签名探测，两种都支持）
 ```
 
 ## 四、后端函数（都可选，签名固定）
@@ -67,7 +100,7 @@ def lock_now(api):
 | `on_uninstall(api)` | 卸载 / 清除数据时 | `api.set_autostart(id, False)` 等清理 |
 | `on_boot(api)` | 每次登录（仅当 `autostart=True` 且已登记） | 按**当前时间**判断该不该做、做多久（如 auto_lock 检查时间窗口） |
 | `handle_cli(argv, api)` | `api.run_admin` 提权后回调 | 执行需管理员的操作（此时已是管理员） |
-| `<action fn>(api)` | 点击 `ACTIONS` 里声明的按钮 | 任意即时动作 |
+| `<action fn>(api[, values])` | 点击 `ACTIONS` 里声明的按钮 | 任意即时动作；`values` = 当前表单值（含未保存改动），可选 |
 
 ## 五、`api`（本体注入的能力，你**唯一**的依赖）
 
@@ -86,6 +119,10 @@ def lock_now(api):
 **支持能力**
 - 配置（共用 `config.json`，按插件分区）：`api.get_settings(id) -> dict` / `api.save_settings(id, dict)`
 - 对话框（工具箱无关，别用 tkinter）：`api.info(msg[,title])` / `api.confirm(msg[,title]) -> bool` / `api.error(msg[,title])`
+- **通用输入弹窗**：`api.prompt(title, fields) -> dict | None`——`fields` 与 `SETTINGS` 同款字段定义（`bool`/`choice`/`int`/`str`/`time`）；用户取消返回 `None`。配 `items` 控件做「添加条目」就是它。
+- **动态刷新**：`api.refresh()`——重渲染「当前显示的插件页」（把最新配置立刻显示出来）。`items` 回调里改完数据后调用它，列表即刻更新。
+- **规范入口与任务动作**：`api.self_path()`（本体规范 exe：安装态 = 安装目录 `app\`、绿色 = 真实入口 exe）/ `api.action_for(extra_args)`（计划任务 `(Command, Arguments)`，含源码态处理）。
+  ⚠ **建计划任务 / 拉起本体时必须用它，别用 `sys.executable`**：编译版（Nuitka onefile）下 `sys.executable` 指向解压缓存里的幽灵 `python.exe`（磁盘上不存在；程序更新清理缓存后，你的任务会全部失效）。
 - 环境：`api.is_installed()` / `api.DRY_RUN` / `api.VERSION` / `api.log(msg)`
 
 ## 六、开机自启：需要 vs 不需要（本体会「记住」）
@@ -142,3 +179,9 @@ def lock_now(api):
 - 只用**标准库 + `api`**。若确实要用第三方库：加进 `requirements.txt`，并确保 PyInstaller 能收集到（onefile 下 `plugins/` 作为 data 打包，插件的 `import` **不被静态分析**，需要时在 `build.py` 里加 hiddenimports/collect）。
 - 放进 `plugins/` 即自动加入；`python build.py` 默认把整个 `plugins/` 打进 exe。
 - 坏插件被本体 `try/except` 隔离——只记 `error.log`、不拖垮其它插件和本体。
+
+## 九、插件 UI 2.0（已上线）
+
+时间选择器（`time`）/ 数字框（`int` + `min`/`max`/`step`）/ 动态状态（`status`）/ 条目列表（`items`）、
+`api.prompt()` 弹窗收集输入、`api.refresh()` 动态刷新、动作函数可选收表单值——见第三、五节。
+**插件图标**（emoji / base64 内嵌图片 / 文件 / FluentIcon）与**文件夹插件**格式已支持——见第二、三节。
