@@ -10,8 +10,10 @@ tkinter 版仍保留在 lock_device.py（可单文件独立运行）；本 Qt �
 import os
 import sys
 import time
+import threading
 import subprocess
 
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFileDialog)
 from PySide6.QtGui import QIcon
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
@@ -31,6 +33,69 @@ else:
     _FROZEN = bool(getattr(core, "IS_FROZEN", _FROZEN))
 
 _CREATE_NO_WINDOW = 0x08000000
+
+
+class _UiBridge(QObject):
+    """把工作线程里的回调调度回 GUI 线程执行（emit 信号 → Qt 自动排队到对象所在线程）。
+
+    插件回调（批量重建计划任务等，实测 5-6 秒）在工作线程跑、界面不卡；
+    对话框/侧栏增删等 UI 操作经这里回到主线程。
+    """
+    _invoke = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._gui_ident = threading.get_ident()   # 构造即在 GUI 主线程：记下主线程标识
+        self._closing = False
+        self._invoke.connect(self._run)
+
+    def begin_close(self):
+        """进入退出流程：需要对话框结果（wait=True）的插件回调立即返回 None，
+        不再阻塞退出（窗口已关，弹窗已无意义）。"""
+        self._closing = True
+
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception:
+            try:
+                core._log("UI 回调失败\n" + core.traceback.format_exc())
+            except Exception:
+                pass
+
+    def call(self, fn, wait=False, timeout=120):
+        """在主线程执行 fn；已在线程内则直接执行。
+        wait=True 时阻塞等待返回值（工作线程里要对话框结果时用）；
+        退出流程中直接返回 None；窗口 C++ 对象已销毁时静默丢弃。"""
+        if threading.get_ident() == self._gui_ident:
+            return fn()
+        if wait and self._closing:
+            return None
+        if not wait:
+            try:
+                self._invoke.emit(fn)
+            except RuntimeError:
+                pass
+            return None
+        done = threading.Event()
+        box = {}
+
+        def _w():
+            try:
+                box["r"] = fn()
+            except Exception as e:
+                box["e"] = e
+            finally:
+                done.set()
+        try:
+            self._invoke.emit(_w)
+        except RuntimeError:
+            return None   # 窗口已销毁（退出中）
+        if not done.wait(timeout):
+            raise TimeoutError("UI 回调等待超时")
+        if "e" in box:
+            raise box["e"]
+        return box.get("r")
 
 
 def _app_icon():
@@ -104,7 +169,8 @@ def _field(v, store, pid, f, vals):
 
 
 def _save_fields(win, fields):
-    """把 fields 的值写回 config（按插件分区）并回调 on_settings_saved。"""
+    """把 fields 的值写回 config（按插件分区）并回调 on_settings_saved。
+    回调可能很慢（如批量重建计划任务）——放工作线程，界面不卡；提示经 ui_bridge 回主线程。"""
     cfg = core.load_config()
     cfg.setdefault("plugins", {})
     touched = {}
@@ -121,13 +187,19 @@ def _save_fields(win, fields):
         m.update(vals)
         cfg["plugins"][pid] = m
     core.save_config(cfg)
-    for meta, mod in core.load_plugins():
-        if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
-            try:
-                mod.on_settings_saved(win.plugin_api, dict(cfg["plugins"].get(meta["id"], {})))
-            except Exception:
-                core._log("on_settings_saved 失败\n" + core.traceback.format_exc())
-    InfoBar.success("已保存", "设置已保存", parent=win, position=InfoBarPosition.TOP)
+
+    def work():
+        for meta, mod in core.load_plugins():
+            if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
+                try:
+                    with core.plugin_op_lock(meta["id"]):
+                        mod.on_settings_saved(win.plugin_api,
+                                              dict(cfg["plugins"].get(meta["id"], {})))
+                except Exception:
+                    core._log("on_settings_saved 失败\n" + core.traceback.format_exc())
+        win.ui_bridge.call(lambda: InfoBar.success(
+            "已保存", "设置已保存", parent=win, position=InfoBarPosition.TOP))
+    core.run_plugin_op(work)
 
 
 # ---------------------------------------------------------------- 对话框：添加快捷 / 安装
@@ -430,10 +502,15 @@ class PluginPageInterface(ScrollArea):
             v.addWidget(save)
 
     def _action(self, fn):
-        try:
-            fn(self.win.plugin_api)
-        except Exception:
-            core._log("plugin action 失败\n" + core.traceback.format_exc())
+        """插件动作按钮：工作线程执行（可能含慢操作），对话框经 ui_bridge 自动回主线程；
+        与开关/保存共用 plugin_op_lock，同一插件不会并发跑多个操作。"""
+        def work():
+            try:
+                with core.plugin_op_lock(self.meta["id"]):
+                    fn(self.win.plugin_api)
+            except Exception:
+                core._log("plugin action 失败\n" + core.traceback.format_exc())
+        core.run_plugin_op(work)
 
 
 # ---------------------------------------------------------------- 插件管理（开关）
@@ -456,35 +533,58 @@ class PluginManageInterface(ScrollArea):
                                          f"v{meta.get('version', '')} · {pid}")
                 card.switchButton.setChecked(pid not in dis)
                 card.switchButton.checkedChanged.connect(
-                    lambda on, mt=meta, md=mod: self._toggle(mt, md, on))
+                    lambda on, mt=meta, md=mod, sw=card.switchButton: self._toggle(mt, md, on, sw))
                 grp.addSettingCard(card)
             v.addWidget(grp)
         v.addStretch(1)
 
-    def _toggle(self, meta, mod, on):
+    def _toggle(self, meta, mod, on, switch=None):
+        """开关插件。插件回调（on_settings_saved / on_uninstall）可能很慢
+        （如批量重建计划任务实测 5-6 秒），放工作线程执行、界面不卡；
+        侧栏入口增删与开关恢复经 ui_bridge 回到主线程。"""
         pid = meta["id"]
-        cfg = core.load_config()
-        dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
-        api = self.win.plugin_api
-        if on:
-            cfg["plugins_disabled"] = dis
-            core.save_config(cfg)
-            if hasattr(mod, "on_settings_saved"):
-                try:
-                    mod.on_settings_saved(api, dict(cfg.get("plugins", {}).get(pid, {})))
-                except Exception:
-                    pass
-            self.win.add_plugin_nav(meta, mod)      # 立即加回侧栏入口
-        else:
-            dis.append(pid)
-            cfg["plugins_disabled"] = dis
-            core.save_config(cfg)
-            if hasattr(mod, "on_uninstall"):
-                try:
-                    mod.on_uninstall(api)           # 关闭时清掉它建的任务 / 自启
-                except Exception:
-                    pass
-            self.win.remove_plugin_nav(pid)         # 立即移除侧栏入口（不提示）
+        if switch is not None:
+            switch.setEnabled(False)   # 处理中禁点；完成后恢复
+
+        def work():
+            try:
+                with core.plugin_op_lock(pid):
+                    cfg = core.load_config()
+                    dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
+                    if on:
+                        cfg["plugins_disabled"] = dis
+                        core.save_config(cfg)
+                        if hasattr(mod, "on_settings_saved"):
+                            try:
+                                mod.on_settings_saved(self.win.plugin_api,
+                                                      dict(cfg.get("plugins", {}).get(pid, {})))
+                            except Exception:
+                                core._log("on_settings_saved 失败\n" + core.traceback.format_exc())
+                    else:
+                        dis.append(pid)
+                        cfg["plugins_disabled"] = dis
+                        core.save_config(cfg)
+                        if hasattr(mod, "on_uninstall"):
+                            try:
+                                mod.on_uninstall(self.win.plugin_api)
+                            except Exception:
+                                core._log("on_uninstall 失败\n" + core.traceback.format_exc())
+            except Exception:
+                core._log("插件开关失败\n" + core.traceback.format_exc())
+            finally:
+                def done():
+                    try:
+                        if switch is not None:
+                            switch.setEnabled(True)
+                        if on:
+                            self.win.add_plugin_nav(meta, mod)      # 立即加回侧栏入口
+                        else:
+                            self.win.remove_plugin_nav(pid)         # 立即移除侧栏入口（不提示）
+                    except Exception:
+                        core._log("插件开关收尾失败\n" + core.traceback.format_exc())
+                self.win.ui_bridge.call(done)
+
+        core.run_plugin_op(work)
 
 
 # ---------------------------------------------------------------- 设置（本机管理）
@@ -574,13 +674,17 @@ class MainWindow(FluentWindow):
         if not ico.isNull():
             self.setWindowIcon(ico)
         self.resize(920, 640)
+        self.ui_bridge = _UiBridge(self)   # 插件慢回调的线程调度桥（工作线程 → GUI 线程）
         self.plugin_api = core._build_plugin_api(None)
-        # 插件对话框走 Qt（否则 app=None 时只 _log、confirm 恒 True——弹窗成了 tk 专属）
-        self.plugin_api.info = lambda msg, title="LockDevice": InfoBar.success(
-            title, msg, parent=self, position=InfoBarPosition.TOP, duration=4000)
-        self.plugin_api.error = lambda msg, title="LockDevice": InfoBar.error(
-            title, msg, parent=self, position=InfoBarPosition.TOP, duration=-1)
-        self.plugin_api.confirm = lambda msg, title="LockDevice": bool(MessageBox(title, msg, self).exec())
+        _ui = self.ui_bridge.call
+        # 插件对话框走 Qt（否则 app=None 时只 _log、confirm 恒 True——弹窗成了 tk 专属）；
+        # 经 _ui 调度：从工作线程（插件慢回调）调用时自动回到 GUI 线程弹。
+        self.plugin_api.info = lambda msg, title="LockDevice": _ui(
+            lambda: InfoBar.success(title, msg, parent=self, position=InfoBarPosition.TOP, duration=4000))
+        self.plugin_api.error = lambda msg, title="LockDevice": _ui(
+            lambda: InfoBar.error(title, msg, parent=self, position=InfoBarPosition.TOP, duration=-1))
+        self.plugin_api.confirm = lambda msg, title="LockDevice": bool(_ui(
+            lambda: MessageBox(title, msg, self).exec(), wait=True))
         self.plugin_pages = {}
         self.home = HomeInterface(self)
         self.addSubInterface(self.home, FIF.HOME, "专注锁定")
@@ -716,6 +820,14 @@ def run():
     w = MainWindow()
     w.show()
     app.exec()
+    # 退出收尾：窗口已关——标记关闭（工作线程里的对话框调用不再等待），
+    # 等进行中的插件操作把「建/删任务」等做完再让进程退出
+    # （防点完开关立刻关窗留下半成品状态；超时兜底、登录 on_boot 自愈）。
+    try:
+        w.ui_bridge.begin_close()
+        core.wait_plugin_ops(30)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

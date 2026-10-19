@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import queue
 import shutil
 import getpass
 import threading
@@ -147,10 +148,15 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.6.3"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.6.4"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.6.4": [
+        "修复插件计划任务指向失效路径：Nuitka onefile 下插件若用 sys.executable 建任务，会指向解压缓存里的幽灵路径（磁盘上不存在）——程序更新清理该缓存后，「多时段自动锁机」等到点不再触发。本体为插件新增规范化入口 api.self_path() / api.action_for()；已装机器登录后插件会自动把任务重建到正确路径（自愈）。",
+        "修复安装版看不到「安装目录 plugins\\」（热添加插件）的问题：1.6.x 更新后界面/计划任务指向 app\\ 子目录的 exe，导致放在安装根目录的热添加插件不被识别、界面里直接消失；现无论从哪个入口启动都能识别该目录（跨版本更新保留）。",
+        "修复开关插件时界面卡 5-6 秒：插件回调里的 schtasks 批量建/删任务是同步阻塞的（本机 245 个计划任务时全表查询 ~2.3 秒），此前占用 UI 线程。现插件回调一律后台线程执行、界面不卡；同一插件的操作自动排队（开关/保存/动作互不竞态）；开关处理期间置灰防连点；关窗时会等待进行中的插件操作收尾（≤30 秒，防「点完开关立刻关窗」留下半成品状态）。",
+    ],
     "1.6.3": [
         "修复 Qt 界面数值框（「时长（分钟）」等）显示不出数字：构建时依赖自动升级到 PySide6 6.12.0，该版本与界面库 qfluentwidgets 存在兼容回归——SpinBox 内部编辑区被压成 1px，数字不可见（6.11.2 正常）。现锁定 PySide6<6.12 构建，恢复正常显示。",
     ],
@@ -764,14 +770,26 @@ _PLUGINS_CACHE = None
 
 
 def _plugins_dirs():
-    """插件目录（按加载顺序，去重）。冻结态：_MEIPASS/plugins（打包内置）+ exe 同级 plugins/
-    （用户把 .py 丢进去即热添加）；源码态：脚本同级 plugins/。存在与否由调用方判断。"""
+    """插件目录（按加载顺序，去重；同 id 后者覆盖前者）。
+    冻结态扫描：_MEIPASS/plugins（打包内置）→ 入口 exe 同级 plugins/（热添加）→
+    安装根目录 plugins/。1.6.x 起任务/快捷方式指向 app\\ 子目录的 exe，而用户的热添加
+    插件习惯放在安装根目录（老位置 exe 同级）——该目录跨版本更新保留，必须继续识别；
+    仅当本进程确实从安装目录内运行时才加它，防止「便携运行误载别的安装的插件」。"""
     dirs = []
     if IS_FROZEN:
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             dirs.append(os.path.join(meipass, "plugins"))                       # 打包内置
         dirs.append(os.path.join(os.path.dirname(_self_path()), "plugins"))     # exe 同级：热添加
+        try:
+            ins = installed_dir()
+            if ins:
+                self_p = os.path.normcase(os.path.abspath(_self_path()))
+                ins_p = os.path.normcase(os.path.abspath(ins))
+                if self_p.startswith(ins_p + os.sep):
+                    dirs.append(os.path.join(ins, "plugins"))                   # 安装根目录：跨更新保留
+        except Exception:
+            pass
     else:
         dirs.append(os.path.join(os.path.dirname(_self_path()), "plugins"))
     seen, out = set(), []
@@ -855,6 +873,63 @@ def active_plugins():
     return [(m, mod) for m, mod in load_plugins() if m.get("id") not in dis]
 
 
+_PLUGIN_LOCKS = {}
+_PLUGIN_LOCKS_GUARD = threading.Lock()
+
+
+def plugin_op_lock(pid):
+    """同一插件的后台操作串行化锁：开关 / 保存回调 / 动作按钮各自在工作线程执行，
+    并发跑 schtasks 建删任务会互相竞态（如「开启建任务」与「关闭删任务」交叠）——
+    统一经此锁排队，保证同一插件同一时刻只有一个操作在跑。"""
+    with _PLUGIN_LOCKS_GUARD:
+        lk = _PLUGIN_LOCKS.get(pid)
+        if lk is None:
+            lk = threading.Lock()
+            _PLUGIN_LOCKS[pid] = lk
+        return lk
+
+
+_PLUGIN_OPS = []
+_PLUGIN_OPS_GUARD = threading.Lock()
+
+
+def run_plugin_op(fn):
+    """在后台线程跑一个插件操作并登记，供关窗/退出前收尾（wait_plugin_ops）——
+    防「点完开关立刻关窗」把建/删任务做到一半就被进程退出打断。
+    线程仍是 daemon（wait_plugin_ops 超时后不阻塞退出）。"""
+    def _run():
+        try:
+            fn()
+        finally:
+            with _PLUGIN_OPS_GUARD:
+                try:
+                    _PLUGIN_OPS.remove(threading.current_thread())
+                except ValueError:
+                    pass
+    t = threading.Thread(target=_run, daemon=True)
+    with _PLUGIN_OPS_GUARD:
+        _PLUGIN_OPS.append(t)
+    t.start()
+    return t
+
+
+def wait_plugin_ops(timeout=30):
+    """等所有进行中的插件操作收尾（关窗 / 退出前调用）。返回是否全部结束。
+    典型操作约 5-6 秒（schtasks 批量为主要耗时）；超时则放弃等待、记日志——
+    插件在下次登录 on_boot 会自动把任务重建到规范路径（自愈兜底）。"""
+    end = time.time() + max(0.0, timeout)
+    while True:
+        with _PLUGIN_OPS_GUARD:
+            alive = [t for t in _PLUGIN_OPS if t.is_alive()]
+        if not alive:
+            return True
+        remain = end - time.time()
+        if remain <= 0:
+            _log("退出前等待插件操作超时，仍有 %d 个在跑（下次登录 on_boot 会自愈）" % len(alive))
+            return False
+        alive[0].join(min(0.3, remain))
+
+
 def _sync_plugin_autostart():
     """按 config.plugins_autostart 记账建/删共享的插件开机自启任务（登录触发·当前用户·免 UAC）。"""
     if bool(load_config().get("plugins_autostart")):
@@ -927,12 +1002,25 @@ def _build_plugin_api(app=None):
             return True
         return relaunch_as_admin(" ".join(["--plugin", str(plugin_id), *[str(a) for a in args]]))
 
+    def self_path():
+        """本体的规范可执行入口：安装态 = 安装目录 app\\LockDevice.exe（ACL 保护、跨版本更新稳定）；
+        未安装 = 当前真实入口 exe（绿色/便携就是它自己）；源码态 = 脚本路径。
+        插件建计划任务 / 拉起本体时**用它**——勿用 sys.executable：
+        Nuitka onefile 下它指向解压缓存里的幽灵 python.exe（磁盘上不存在 / 更新清理缓存即失效）。"""
+        return installed_main() or _self_path()
+
+    def action_for(extra_args=""):
+        """计划任务动作 (Command, Arguments)，与本体内部同款（含源码态 pythonw 处理）。
+        例：cmd, args = api.action_for("--plugin my_id tick")。"""
+        return _action_for(extra_args)
+
     # 本体对插件只提供三类核心能力：**锁机**(start_lock) + **唤醒插件**(set_autostart → 登录回调 on_boot)
     # + **提权**(is_admin / run_admin，让插件继承本体管理员权限)；外加配置存取 / 对话框 / 环境信息 等支持。
     # 功能逻辑（何时锁、锁多久…）全在插件自己。界面由本体按 SETTINGS/ACTIONS 渲染（换 Qt 插件零改动）。
     return types.SimpleNamespace(
         get_settings=get_settings, save_settings=save_settings, set_autostart=set_autostart,
         start_lock=start_lock, is_admin=is_admin, run_admin=run_admin, is_installed=is_installed,
+        self_path=self_path, action_for=action_for,
         DRY_RUN=DRY_RUN, VERSION=VERSION, log=_log,
         info=info, confirm=confirm, error=error)
 
@@ -1220,6 +1308,12 @@ def do_install(install_dir=None, desktop=True, launch=True):
         # 安装目录上 ACL 锁：普通用户只读，防非管理员病毒篡改被「最高权限任务」运行的 exe
         _lock_dir_acl(install_dir)
         ok, msg = create_autostart_tasks()
+        # 刷新插件开机自启任务（TASK_PLUGIN_BOOT）指向：统一到规范入口（安装态 = app\LockDevice.exe）。
+        # 旧任务可能指向历史路径；更新后立即重指，插件后台行为免等重启即可恢复。
+        try:
+            _sync_plugin_autostart()
+        except Exception:
+            _log("刷新插件自启任务失败\n" + traceback.format_exc())
         create_shortcuts(desktop=desktop)
         if ok:
             if launch and not DRY_RUN:
@@ -1587,6 +1681,83 @@ class App:
         _set_icon(self.root)
         self.content = None
         self.plugin_api = _build_plugin_api(self)   # 注入给插件的能力命名空间
+        # 插件回调可能很慢（如批量 schtasks 建/删任务实测 5-6 秒）：统一放工作线程执行、
+        # 界面不卡；对话框经 self._ui() 调度回主线程；_uiq 由主线程轮询消费。
+        # _closing：进入退出流程后，需要对话框结果（wait=True）的插件回调立即返回，
+        # 不阻塞退出；退出前由 run() 收尾等待进行中的插件操作（wait_plugin_ops）。
+        self._closing = False
+        self._uiq = queue.Queue()
+        self.root.after(50, self._drain_uiq)
+        self._wrap_plugin_api_dialogs()
+
+    # ---------------- 插件回调的线程调度（工作线程 → Tk 主线程） ----------------
+    def _wrap_plugin_api_dialogs(self):
+        """把插件 api 的对话框包成线程安全：工作线程里调用时调度回主线程执行。"""
+        def ui_info(msg, title="LockDevice"):
+            if DRY_RUN:
+                _log(f"[plugin] {msg}")
+            else:
+                self._ui(lambda: messagebox.showinfo(title, msg))
+
+        def ui_error(msg, title="LockDevice"):
+            if DRY_RUN:
+                _log(f"[plugin ERROR] {msg}")
+            else:
+                self._ui(lambda: messagebox.showerror(title, msg))
+
+        def ui_confirm(msg, title="LockDevice"):
+            if DRY_RUN:
+                return True
+            return bool(self._ui(lambda: messagebox.askyesno(title, msg), wait=True))
+
+        self.plugin_api.info = ui_info
+        self.plugin_api.error = ui_error
+        self.plugin_api.confirm = ui_confirm
+
+    def _drain_uiq(self):
+        """主线程轮询：执行工作线程排入的 UI 回调。"""
+        try:
+            while True:
+                try:
+                    fn = self._uiq.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception:
+                    _log("UI 回调失败\n" + traceback.format_exc())
+        finally:
+            try:
+                self.root.after(50, self._drain_uiq)
+            except Exception:
+                pass
+
+    def _ui(self, fn, wait=False, timeout=120):
+        """把 fn 调度到 Tk 主线程执行；已在主线程则直接执行。
+        wait=True 时阻塞等待返回值（工作线程里要对话框结果时用）；
+        退出流程中（_closing）需要结果的调用直接返回 None，不阻塞退出。"""
+        if wait and self._closing:
+            return None
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        if not wait:
+            self._uiq.put(fn)
+            return None
+        ev = threading.Event()
+        box = {}
+
+        def _w():
+            try:
+                box["r"] = fn()
+            except Exception as e:
+                box["e"] = e
+            finally:
+                ev.set()
+        self._uiq.put(_w)
+        ev.wait(timeout)
+        if "e" in box:
+            raise box["e"]
+        return box.get("r")
 
     def _log_cb_exc(self, exc, val, tb):
         _log("CALLBACK 异常:\n" + "".join(traceback.format_exception(exc, val, tb)))
@@ -1600,6 +1771,13 @@ class App:
             self.root.mainloop()
         except tk.TclError as ex:
             _log(f"mainloop TclError: {ex}")
+        # 退出收尾：窗口已关（或异常退出）——不再弹任何对话框；等进行中的插件操作
+        # 把「建/删任务」等做完再让进程退出（防点完开关立刻关窗留下半成品状态）。
+        self._closing = True
+        try:
+            wait_plugin_ops(30)
+        except Exception:
+            pass
 
     # ---- 关闭拦截：未保存改动提醒 ----
     def _on_close(self):
@@ -1609,6 +1787,7 @@ class App:
                 return
             if ans:
                 self._save_all()
+        self._closing = True   # 即将销毁窗口：工作线程里的对话框调用不再等待
         self.root.destroy()
 
     def on_back(self):
@@ -1769,14 +1948,23 @@ class App:
             merged.update(values)
             cfg["plugins"][pid] = merged
         save_config(cfg)
-        for meta, mod in load_plugins():
-            if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
-                try:
-                    mod.on_settings_saved(self.plugin_api, dict(cfg["plugins"].get(meta["id"], {})))
-                except Exception:
-                    _log("plugin on_settings_saved 失败 " + meta["id"] + "\n" + traceback.format_exc())
-        messagebox.showinfo("已保存", "设置已保存。")
-        self.show_settings()
+
+        # 插件回调可能很慢（如批量重建计划任务）：放工作线程，界面不卡；
+        # 收尾的提示与页面重绘调度回主线程。回调与开关/动作按钮经 plugin_op_lock 串行化。
+        def work():
+            for meta, mod in load_plugins():
+                if meta["id"] in touched and hasattr(mod, "on_settings_saved"):
+                    try:
+                        with plugin_op_lock(meta["id"]):
+                            mod.on_settings_saved(self.plugin_api,
+                                                  dict(cfg["plugins"].get(meta["id"], {})))
+                    except Exception:
+                        _log("plugin on_settings_saved 失败 " + meta["id"] + "\n" + traceback.format_exc())
+            def done():
+                messagebox.showinfo("已保存", "设置已保存。")
+                self.show_settings()
+            self._ui(done)
+        run_plugin_op(work)
 
     def _render_plugin_settings(self, box, plugins):
         """按各插件声明的 SETTINGS（前端 schema）渲染表单，填充 self._settings_vars。"""
@@ -1805,13 +1993,25 @@ class App:
         box.pack(side="top", fill="both", expand=True)
         self._settings_vars = []
         self._render_plugin_settings(box, [(meta, mod)])
-        # 动作按钮（ACTIONS 声明 → 本体渲染，点击调插件后端函数）
+        # 动作按钮（ACTIONS 声明 → 本体渲染，点击调插件后端函数；慢动作走工作线程）
         for act in getattr(mod, "ACTIONS", []) or []:
             fn = getattr(mod, act.get("fn", ""), None)
             if callable(fn):
                 self._btn(box, act.get("label", act.get("fn", "")),
-                          (lambda f=fn: f(self.plugin_api)), COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
+                          (lambda f=fn, p=meta["id"]: self._run_plugin_action(p, f)),
+                          COL_BLUE).pack(fill="x", padx=8, pady=(10, 2))
         self._bring_to_front()
+
+    def _run_plugin_action(self, pid, fn):
+        """插件动作按钮：工作线程执行（可能含 schtasks 等慢操作），对话框自动调度回主线程；
+        与开关/保存共用 plugin_op_lock，同一插件不会并发跑多个操作。"""
+        def work():
+            try:
+                with plugin_op_lock(pid):
+                    fn(self.plugin_api)
+            except Exception:
+                _log("plugin action 失败\n" + traceback.format_exc())
+        run_plugin_op(work)
 
     # ---------------- 插件管理（启用/关闭） ----------------
     def show_plugin_manage(self):
@@ -1837,30 +2037,52 @@ class App:
             var = tk.BooleanVar(value=(pid not in dis))
             ctk.CTkLabel(row, text=f"{meta.get('name', pid)}  ·  v{meta.get('version', '')}",
                          anchor="w", font=(FONT, 13)).pack(side="left", fill="x", expand=True)
-            ctk.CTkSwitch(row, text="", variable=var,
-                          command=lambda p=pid, m=mod, v=var: self._toggle_plugin(p, m, v.get())).pack(side="right")
+            sw = ctk.CTkSwitch(row, text="", variable=var)
+            sw.configure(command=lambda p=pid, m=mod, v=var, s=sw: self._toggle_plugin(p, m, v.get(), s))
+            sw.pack(side="right")
         self._bring_to_front()
 
-    def _toggle_plugin(self, pid, mod, on):
-        cfg = load_config()
-        dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
-        if on:
-            cfg["plugins_disabled"] = dis
-            save_config(cfg)
-            if hasattr(mod, "on_settings_saved"):
-                try:
-                    mod.on_settings_saved(self.plugin_api, dict(cfg.get("plugins", {}).get(pid, {})))
-                except Exception:
-                    _log("on_settings_saved 失败\n" + traceback.format_exc())
-        else:
-            dis.append(pid)
-            cfg["plugins_disabled"] = dis
-            save_config(cfg)
-            if hasattr(mod, "on_uninstall"):
-                try:
-                    mod.on_uninstall(self.plugin_api)
-                except Exception:
-                    _log("on_uninstall 失败\n" + traceback.format_exc())
+    def _toggle_plugin(self, pid, mod, on, switch=None):
+        """开关插件。插件的 on_settings_saved/on_uninstall 可能很慢（如批量重建计划任务，
+        实测 5-6 秒），放工作线程执行避免卡界面；对话框会自动调度回主线程。
+
+        防连点/防竞态：处理期间开关置灰（连点无效）；同一插件的操作经 plugin_op_lock
+        串行化（与保存回调/动作按钮互相排队），不会出现并发建/删任务的竞态。"""
+        if switch is not None:
+            try:
+                switch.configure(state="disabled")   # 处理中禁点；完成后恢复
+            except Exception:
+                pass
+
+        def work():
+            try:
+                with plugin_op_lock(pid):
+                    cfg = load_config()
+                    dis = [x for x in cfg.get("plugins_disabled", []) if x != pid]
+                    if on:
+                        cfg["plugins_disabled"] = dis
+                        save_config(cfg)
+                        if hasattr(mod, "on_settings_saved"):
+                            try:
+                                mod.on_settings_saved(self.plugin_api,
+                                                      dict(cfg.get("plugins", {}).get(pid, {})))
+                            except Exception:
+                                _log("on_settings_saved 失败\n" + traceback.format_exc())
+                    else:
+                        dis.append(pid)
+                        cfg["plugins_disabled"] = dis
+                        save_config(cfg)
+                        if hasattr(mod, "on_uninstall"):
+                            try:
+                                mod.on_uninstall(self.plugin_api)
+                            except Exception:
+                                _log("on_uninstall 失败\n" + traceback.format_exc())
+            except Exception:
+                _log("插件开关失败\n" + traceback.format_exc())
+            finally:
+                if switch is not None:
+                    self._ui(lambda: switch.configure(state="normal"))
+        run_plugin_op(work)
 
     def on_install(self):
         self._install_dialog()
