@@ -150,10 +150,14 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.6.4"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.6.5"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.6.5": [
+        "修复打开的窗口不在前台、要手动点任务栏才能出来：免 UAC 链路是「计划任务 → 提权实例」，而 Task Scheduler 启动的进程没有前台激活权限，窗口默认开在后台。现未提权中转实例在触发任务前先调 AllowSetForegroundWindow(ASFW_ANY) 授权；提权实例显示主窗后用「附加输入队列」技巧强制前置（含最小化恢复；已在前台时延迟补枪自动跳过，不做无谓抢焦点）。",
+        "修复每次打开要等约 3 秒：安装时把程序从 onefile 解压产物释放到 app\\ 后，主程序名仍带着版本/变体后缀（LockDevice-1.6.4-qt-plugins.exe），而快捷方式/计划任务只认规范名 app\\LockDevice.exe——对不上号就一路回退到 onefile（每次启动都要过一次解压缓存检查，单次约 1 秒，而启动链路要走两次进程）。现安装/更新时把 app\\ 主程序自动改名为规范名，并对既有安装做兼容探测，两条启动腿都走「零解压固化版」，单次引导 1 秒 → 0.15 秒左右。",
+    ],
     "1.6.4": [
         "修复插件计划任务指向失效路径：Nuitka onefile 下插件若用 sys.executable 建任务，会指向解压缓存里的幽灵路径（磁盘上不存在）——程序更新清理该缓存后，「多时段自动锁机」等到点不再触发。本体为插件新增规范化入口 api.self_path() / api.action_for()；已装机器登录后插件会自动把任务重建到正确路径（自愈）。",
         "修复安装版看不到「安装目录 plugins\\」（热添加插件）的问题：1.6.x 更新后界面/计划任务指向 app\\ 子目录的 exe，导致放在安装根目录的热添加插件不被识别、界面里直接消失；现无论从哪个入口启动都能识别该目录（跨版本更新保留）。",
@@ -277,6 +281,18 @@ def _run(args):
     """隐藏控制台执行命令，返回 CompletedProcess。"""
     return subprocess.run(args, capture_output=True, text=True,
                           creationflags=CREATE_NO_WINDOW)
+
+
+def _allow_child_foreground():
+    """把前台激活权限一次性放开给随后经计划任务拉起的实例（免 UAC 提权链路）。
+
+    本进程由用户点击启动、握有前台权限；Task Scheduler 启动的实例没有前台权限，
+    窗口会开在后台（要手动点任务栏才出来）。AllowSetForegroundWindow(ASFW_ANY)
+    即官方为此提供的放行手段——紧随其后的提权实例才能把自己带到前台。"""
+    try:
+        ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
+    except Exception:
+        pass
 
 
 def _hide_console():
@@ -463,8 +479,22 @@ def installed_main():
     d = installed_dir()
     if not d:
         return None
-    app_exe = os.path.join(d, "app", _main_name())
-    return app_exe if os.path.exists(app_exe) else os.path.join(d, _main_name())
+    app_dir = os.path.join(d, "app")
+    app_exe = os.path.join(app_dir, _main_name())
+    if os.path.exists(app_exe):
+        return app_exe
+    # 兼容 1.6.4 及更早的安装：解压产物是原样复制进 app\ 的，主程序名带版本/变体后缀
+    # （LockDevice-x.y.z-qt-plugins.exe）——按前缀探测，避免白回退 onefile（每次多等约 1 秒）。
+    try:
+        for fn in sorted(os.listdir(app_dir)):
+            low = fn.lower()
+            if low.startswith("lockdevice") and low.endswith(".exe"):
+                p = os.path.join(app_dir, fn)
+                if os.path.isfile(p):
+                    return p
+    except OSError:
+        pass
+    return os.path.join(d, _main_name())
 
 
 def _version_file():
@@ -1405,6 +1435,23 @@ def _rename_or_rmtree(path, suffix=".old"):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _rename_app_main(app_dir):
+    """把 app\\ 里带版本/变体后缀的主程序（LockDevice-x.y.z-qt-plugins.exe）改名为
+    规范名 LockDevice.exe——installed_main()/快捷方式/计划任务全认它（启动零解压）。
+    此前漏了这步：app\\ 里的 exe 不被识别，启动一路回退 onefile，每次白等约 1 秒。幂等。"""
+    target = os.path.join(app_dir, _main_name())
+    if os.path.isfile(target):
+        return
+    try:
+        for fn in os.listdir(app_dir):
+            low = fn.lower()
+            if low.startswith("lockdevice") and low.endswith(".exe"):
+                os.replace(os.path.join(app_dir, fn), target)
+                return
+    except OSError as e:
+        _log("app 主程序改名失败：%r" % (e,))
+
+
 def do_install(install_dir=None, desktop=True, launch=True):
     """执行安装。需管理员权限。返回 (成功?, 信息)。"""
     try:
@@ -1442,6 +1489,7 @@ def do_install(install_dir=None, desktop=True, launch=True):
                         _log("复制 app 目录失败：%r" % (e,))
                         return False, ("安装失败：无法释放程序文件到\n" + app_dst +
                                        "\n（文件可能被占用，请关闭所有 LockDevice 实例后重试）")
+                    _rename_app_main(app_dst)   # 主程序改规范名（见函数注释）
             if not IS_FROZEN:
                 ico = _icon_path()
                 if ico:
@@ -1467,6 +1515,7 @@ def do_install(install_dir=None, desktop=True, launch=True):
         create_shortcuts(desktop=desktop)
         if ok:
             if launch and not DRY_RUN:
+                _allow_child_foreground()   # 安装完自动打开的实例也直接到前台
                 _run(["schtasks", "/run", "/tn", TASK_OPEN])
             return True, ("安装完成！\n\n"
                           f"· 安装位置：{install_dir}\n"
@@ -1981,6 +2030,11 @@ class App:
             pass
 
     def run(self):
+        try:
+            # 免 UAC 链路（计划任务）启动的实例没有前台权限：窗口会开在后台，强制前置。
+            self._bring_to_front()
+        except Exception:
+            pass
         try:
             self.root.mainloop()
         except tk.TclError as ex:
@@ -3336,6 +3390,7 @@ def main():
             # 新版文件：免 UAC 打开已安装版启动器，并「同时」弹独立「发现更新」窗——两窗并存，
             # 不再要求先关更新窗才出启动器。启动器是另一个（已提权）进程，先拉起它；
             # 「发现更新」窗随后多抢几次前台，稳定叠在启动器之上（见 show_update_window）。
+            _allow_child_foreground()   # 前台权限放给提权实例：窗口直接到前台而非后台
             _run(["schtasks", "/run", "/tn", TASK_OPEN])
             if _qt_available():                       # qt 版：弹 Qt「发现更新」窗
                 try:
@@ -3350,6 +3405,7 @@ def main():
                 app.run()
             return
         # 正常同版本 / 已「跳过此版本」：转交已安装任务打开后退出（免 UAC，不再弹更新窗）
+        _allow_child_foreground()   # 前台权限放给提权实例（否则窗口开在后台要点任务栏）
         if _run(["schtasks", "/run", "/tn", TASK_OPEN]).returncode == 0:
             return
     if _qt_available():   # 有 gui 文件夹 + PySide6/qfluentwidgets → 用 Qt 现代界面

@@ -13,7 +13,7 @@ import time
 import threading
 import subprocess
 
-from PySide6.QtCore import QObject, Signal, QTime, Qt, QByteArray, QRect
+from PySide6.QtCore import QObject, Signal, QTime, Qt, QByteArray, QRect, QTimer
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFileDialog)
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
@@ -111,6 +111,48 @@ def _spawn(*args):
     exe = core._self_path()
     cmd = [exe, *args] if _FROZEN else [core._pythonw_path(), exe, *args]
     subprocess.Popen(cmd, creationflags=_CREATE_NO_WINDOW)
+
+
+def _force_foreground_win(w, retry=False):
+    """把窗口强制拉到前台（Windows；其它平台/失败时静默）。
+
+    免 UAC 链路的正规入口是计划任务：Task Scheduler 启动的进程**没有前台激活权限**，
+    窗口默认开在后台——要手动点任务栏才能出来。这里用「附加输入队列」技巧：临时把
+    本线程挂到当前前台窗口的输入队列上，SetForegroundWindow 即被放行；并兜底
+    BringWindowToTop。retry=True 供延迟补枪：已在前台就跳过，不做无谓抢焦点。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+    except Exception:
+        return
+    try:
+        hwnd = int(w.winId())
+    except Exception:
+        return
+    try:
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)               # SW_RESTORE：从最小化恢复
+        if retry and u.GetForegroundWindow() == hwnd:
+            return
+        try:
+            w.raise_()
+            w.activateWindow()
+        except Exception:
+            pass
+        fg = u.GetForegroundWindow()
+        tid_fg = u.GetWindowThreadProcessId(fg, None) if fg else 0
+        tid_me = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = False
+        if tid_fg and tid_fg != tid_me:
+            attached = bool(u.AttachThreadInput(tid_me, tid_fg, True))
+        try:
+            u.SetForegroundWindow(hwnd)
+            u.BringWindowToTop(hwnd)
+        finally:
+            if attached:
+                u.AttachThreadInput(tid_me, tid_fg, False)
+    except Exception:
+        pass
 
 
 def _themed_body(area, name):
@@ -1038,8 +1080,8 @@ def run_update_prompt():
     setTheme(Theme.DARK)
     w = UpdateWindow()
     w.show()
-    w.raise_()
-    w.activateWindow()
+    _force_foreground_win(w)   # 与启动器实例并存时也稳定到前台（替代裸 raise/activate）
+    QTimer.singleShot(800, lambda: _force_foreground_win(w, retry=True))
     app.exec()
 
 
@@ -1051,6 +1093,11 @@ def run():
     setTheme(Theme.DARK)
     w = MainWindow()
     w.show()
+    # 免 UAC 链路（计划任务）启动的实例没有前台权限：窗口会被开在后台，用户得点任务栏。
+    # 立即强制前置 + 两次延迟补枪（已在前台则自动跳过；提权实例常在 1 秒内才显示完）。
+    _force_foreground_win(w)
+    QTimer.singleShot(600, lambda: _force_foreground_win(w, retry=True))
+    QTimer.singleShot(1400, lambda: _force_foreground_win(w, retry=True))
     app.exec()
     # 退出收尾：窗口已关——标记关闭（工作线程里的对话框调用不再等待），
     # 等进行中的插件操作把「建/删任务」等做完再让进程退出
