@@ -532,8 +532,10 @@ class HomeInterface(ScrollArea):
         v.addWidget(start)
         self.cancel_sd = PushButton("⚠  解除已存在的关机计划")
         self.cancel_sd.clicked.connect(self._cancel_shutdown)
+        self.cancel_sd.setVisible(False)
         v.addWidget(self.cancel_sd)
-        self._refresh_cancel_shutdown()
+        # 首屏异步探测关机计划任务，避免同步调 schtasks 阻塞窗口首帧显示
+        self._refresh_cancel_shutdown(async_check=True)
 
     def _sync(self):
         m1 = self.mode.currentIndex() == 0
@@ -649,8 +651,18 @@ class HomeInterface(ScrollArea):
         self._refresh_cancel_shutdown()
         core.do_shutdown(0 if instant else core.SHUTDOWN_DELAY, "LockDevice：电脑即将关机，请保存文件")
 
-    def _refresh_cancel_shutdown(self):
-        """存在定时关机任务时才显示「解除」按钮（对应 tk show_main 的同款按钮）。"""
+    def _refresh_cancel_shutdown(self, async_check=False):
+        """存在定时关机任务时才显示「解除」按钮（对应 tk show_main 的同款按钮）。
+        首屏传入 async_check=True 走后台线程，避免同步调 schtasks 阻塞窗口首帧。"""
+        if async_check:
+            def _probe():
+                try:
+                    exists = bool(core._task_exists(core.TASK_SHUTDOWN))
+                except Exception:
+                    exists = False
+                self.win.ui_bridge.call(lambda: self.cancel_sd.setVisible(exists))
+            threading.Thread(target=_probe, daemon=True).start()
+            return
         try:
             exists = bool(core._task_exists(core.TASK_SHUTDOWN))
         except Exception:
@@ -669,16 +681,25 @@ class HomeInterface(ScrollArea):
 
 # ---------------------------------------------------------------- 每个插件一页
 class PluginPageInterface(ScrollArea):
-    def __init__(self, win, meta, mod):
+    def __init__(self, win, meta, mod, lazy=False):
         super().__init__()
         self.win = win
         self.meta = meta
         self.mod = mod
         self._fields = []
-        self._build()
+        self._built = False
+        self.setObjectName("plugin_" + self.meta["id"])
+        if not lazy:
+            self._build()
+
+    def ensure_built(self):
+        """懒加载入口：首次切到本页时再真正构建表单/status/items（首屏零开销）。"""
+        if not self._built:
+            self._build()
 
     def _build(self):
         """（重）构建页面内容：SETTINGS 表单 + ACTIONS 按钮 + 保存（api.refresh 会再调本函数）。"""
+        self._built = True
         v = _themed_body(self, "plugin_" + self.meta["id"])
         v.addWidget(TitleLabel(self.meta.get("name", self.meta["id"])))
         v.addWidget(BodyLabel(f"v{self.meta.get('version', '')}"))
@@ -705,6 +726,7 @@ class PluginPageInterface(ScrollArea):
 
     def _current_values(self):
         """当前表单值（含未保存改动）→ {key: value}。仅主线程调用（读控件）。"""
+        self.ensure_built()
         out = {}
         for _pid, key, ftype, getter in self._fields:
             try:
@@ -723,6 +745,7 @@ class PluginPageInterface(ScrollArea):
         """插件动作按钮：主线程取当前表单值 → 工作线程执行（可能含慢操作），
         对话框经 ui_bridge 自动回主线程；与开关/保存共用 plugin_op_lock。
         动作函数签名：`fn(api, values)` 或 `fn(api)` 均可（签名探测）。"""
+        self.ensure_built()
         values = self._current_values()
 
         def work():
@@ -736,9 +759,20 @@ class PluginPageInterface(ScrollArea):
 
 # ---------------------------------------------------------------- 插件管理（开关）
 class PluginManageInterface(ScrollArea):
-    def __init__(self, win):
+    def __init__(self, win, lazy=False):
         super().__init__()
         self.win = win
+        self._built = False
+        self.setObjectName("pluginmanage")
+        if not lazy:
+            self._build()
+
+    def ensure_built(self):
+        if not self._built:
+            self._build()
+
+    def _build(self):
+        self._built = True
         v = _themed_body(self, "pluginmanage")
         v.addWidget(TitleLabel("插件"))
         v.addWidget(BodyLabel("开关启用 / 关闭插件（关闭后不加载运行、开机也不唤醒；侧栏入口重启后更新）"))
@@ -811,9 +845,20 @@ class PluginManageInterface(ScrollArea):
 
 # ---------------------------------------------------------------- 设置（本机管理）
 class SettingsInterface(ScrollArea):
-    def __init__(self, win):
+    def __init__(self, win, lazy=False):
         super().__init__()
         self.win = win
+        self._built = False
+        self.setObjectName("settings")
+        if not lazy:
+            self._build()
+
+    def ensure_built(self):
+        if not self._built:
+            self._build()
+
+    def _build(self):
+        self._built = True
         v = _themed_body(self, "settings")
         v.addWidget(TitleLabel("设置"))
 
@@ -914,21 +959,30 @@ class MainWindow(FluentWindow):
         self.plugin_pages = {}
         self.home = HomeInterface(self)
         self.addSubInterface(self.home, FIF.HOME, "专注锁定")
+        # 首屏极速显现：非首页（插件页 / 插件管理 / 设置）先以轻壳占位挂侧栏，
+        # 切到对应页时再按需构建，首帧不阻塞在表单控件和状态读取上。
         for meta, mod in core.active_plugins():
-            self.add_plugin_nav(meta, mod)
-        self.pmanage = PluginManageInterface(self)
+            self.add_plugin_nav(meta, mod, lazy=True)
+        self.pmanage = PluginManageInterface(self, lazy=True)
         self.addSubInterface(self.pmanage, FIF.APPLICATION, "插件", NavigationItemPosition.BOTTOM)
-        self.settings = SettingsInterface(self)
+        self.settings = SettingsInterface(self, lazy=True)
         self.addSubInterface(self.settings, FIF.SETTING, "设置", NavigationItemPosition.BOTTOM)
+        self.stackedWidget.currentChanged.connect(self._on_page_changed)
 
-    def add_plugin_nav(self, meta, mod):
+    def _on_page_changed(self, _index):
+        """切页时触发目标页的懒加载构建（幂等；已构建则立即返回）。"""
+        cur = self.stackedWidget.currentWidget()
+        if cur is not None and hasattr(cur, "ensure_built"):
+            cur.ensure_built()
+
+    def add_plugin_nav(self, meta, mod, lazy=False):
         """给一个启用的插件加侧栏入口（幂等）。"""
         if not (getattr(mod, "SETTINGS", None) or getattr(mod, "ACTIONS", None)):
             return
         pid = meta["id"]
         if pid in self.plugin_pages:
             return
-        page = PluginPageInterface(self, meta, mod)
+        page = PluginPageInterface(self, meta, mod, lazy=lazy)
         self.addSubInterface(page, _plugin_icon_qt(meta, mod) or FIF.APPLICATION,
                              meta.get("button") or meta.get("name") or pid)
         self.plugin_pages[pid] = page

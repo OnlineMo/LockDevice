@@ -150,10 +150,14 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.6.5"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.6.6"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.6.6": [
+        "启动提速（Qt 首屏极速显现 + 懒加载非首页）：打开主窗时先呈现「专注锁定」首页，同步进行的关机任务查询挪到后台线程；各插件页、「插件管理」、「设置」页按需构建（切到时立即渲染），启动不再一次性阻塞构造所有页面。",
+        "更新自动迁移旧版快捷方式：安装/更新时检测桌面是否已存在由旧版生成的 LockDevice.lnk（例如仍指向根目录 onefile 或旧版带后缀 exe 的快捷方式），若是则自动更新指向最新零解压入口 app\\LockDevice.exe（不再因更新时 desktop=False 而遗留慢快捷方式，也不会误删/乱改无关快捷方式）。",
+    ],
     "1.6.5": [
         "修复打开的窗口不在前台、要手动点任务栏才能出来：免 UAC 链路是「计划任务 → 提权实例」，而 Task Scheduler 启动的进程没有前台激活权限，窗口默认开在后台。现未提权中转实例在触发任务前先调 AllowSetForegroundWindow(ASFW_ANY) 授权；提权实例显示主窗后用「附加输入队列」技巧强制前置（含最小化恢复；已在前台时延迟补枪自动跳过，不做无谓抢焦点）。",
         "修复每次打开要等约 3 秒：安装时把程序从 onefile 解压产物释放到 app\\ 后，主程序名仍带着版本/变体后缀（LockDevice-1.6.4-qt-plugins.exe），而快捷方式/计划任务只认规范名 app\\LockDevice.exe——对不上号就一路回退到 onefile（每次启动都要过一次解压缓存检查，单次约 1 秒，而启动链路要走两次进程）。现安装/更新时把 app\\ 主程序自动改名为规范名，并对既有安装做兼容探测，两条启动腿都走「零解压固化版」，单次引导 1 秒 → 0.15 秒左右。",
@@ -1245,9 +1249,51 @@ def _desktop_dir():
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
+def _read_lnk_target(lnk_path):
+    """读取 .lnk 快捷方式的 TargetPath（失败或不存在返回空串）。"""
+    if not lnk_path or not os.path.isfile(lnk_path):
+        return ""
+    if DRY_RUN:
+        return ""
+    try:
+        esc = str(lnk_path).replace("'", "''")
+        ps = f"(New-Object -ComObject WScript.Shell).CreateShortcut('{esc}').TargetPath"
+        r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+        if r.returncode == 0:
+            return (r.stdout or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_legacy_shortcut_target(target_path, install_dir, desired_target):
+    """判断已有快捷方式的 TargetPath 是否是旧版 LockDevice 生成且需要迁移更新。
+    仅当目标确实属于本程序安装目录（如根目录 onefile `LockDevice.exe`、旧带版本后缀
+    `app\\LockDevice-x.y.z-*.exe` 或已失效路径），且与期望目标不同时返回 True。"""
+    if not target_path or not desired_target:
+        return False
+    t_norm = os.path.normcase(os.path.abspath(target_path))
+    d_norm = os.path.normcase(os.path.abspath(desired_target))
+    if t_norm == d_norm:
+        return False
+    base = os.path.basename(t_norm)
+    if not (base.startswith("lockdevice") and base.endswith(".exe")):
+        return False
+    if install_dir:
+        ins_norm = os.path.normcase(os.path.abspath(install_dir))
+        if t_norm.startswith(ins_norm + os.sep):
+            return True
+    # 若快捷方式指向旧安装位置（同命名规范且位于 LockDevice 目录下，如换过安装目录），也视为旧版生成
+    parent_low = os.path.basename(os.path.dirname(t_norm))
+    grand_low = os.path.basename(os.path.dirname(os.path.dirname(t_norm)))
+    return parent_low == "lockdevice" or (parent_low == "app" and grand_low == "lockdevice")
+
+
 def create_shortcuts(desktop=False):
     """开始菜单（可选桌面）放带图标的 .lnk：打开=指向本体（靠程序自动分流免 UAC 提权）；
-    卸载=本体 --uninstall（自提权一次）。"""
+    卸载=本体 --uninstall（自提权一次）。
+    更新时即使 desktop=False，也会检查桌面已有 LockDevice.lnk：若由旧版生成且指向旧入口
+    （如根目录 onefile 或带版本后缀 exe），自动刷新到当前零解压入口 app\\LockDevice.exe。"""
     d = installed_dir() or APP_DIR
     if IS_FROZEN:
         # 指向安装目录下的 app 版本（解压固化、启动零解压）；旧单文件安装回退根目录 exe
@@ -1266,8 +1312,14 @@ def create_shortcuts(desktop=False):
     _make_lnk(os.path.join(sm, "LockDevice.lnk"), target, base_args, icon, d)
     _make_lnk(os.path.join(sm, "卸载 LockDevice.lnk"), target,
               (base_args + " --uninstall").strip(), icon, d)
+    desk_lnk = os.path.join(_desktop_dir(), "LockDevice.lnk")
     if desktop:
-        _make_lnk(os.path.join(_desktop_dir(), "LockDevice.lnk"), target, base_args, icon, d)
+        _make_lnk(desk_lnk, target, base_args, icon, d)
+    elif os.path.isfile(desk_lnk):
+        cur_target = _read_lnk_target(desk_lnk)
+        if _is_legacy_shortcut_target(cur_target, d, target):
+            _log(f"检测到旧版桌面快捷方式，自动更新：{cur_target} -> {target}")
+            _make_lnk(desk_lnk, target, base_args, icon, d)
 
 
 def remove_shortcuts():
